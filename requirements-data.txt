@@ -1,0 +1,14 @@
+# Data pipeline dependencies (separate from the Streamlit research app).
+# Install with:  py -3 -m pip install -r requirements-data.txt
+pandas>=2.2
+numpy>=1.26
+requests>=2.31
+pyarrow>=15
+yfinance>=0.2.40
+tqdm>=4.66
+tenacity>=8.2
+openpyxl>=3.1
+feedparser>=6.0
+warcio>=1.7          # Common Crawl WARC parsing
+trafilatura>=1.8     # article text extraction
+psycopg[binary]>=3.1   # only needed for the Phase 2 Postgres loader

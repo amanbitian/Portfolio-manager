@@ -1,0 +1,4 @@
+pandas>=2.2
+numpy>=1.26
+streamlit>=1.36
+scipy>=1.12
