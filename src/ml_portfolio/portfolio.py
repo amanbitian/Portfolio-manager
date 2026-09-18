@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -10,18 +9,34 @@ from uuid import uuid4
 import numpy as np
 import pandas as pd
 
-from .decisions import latest_decision
+from .decisions import MIN_LISTING_HISTORY_DAYS, latest_decision
 from .execution import rebalance_cost_rate
 from .optimizers import AllocationConfig, risk_checks
+from .storage import atomic_parquet, price_key, read_table, write_artifact
+from .holdings import INSTRUMENT_TYPES, value_purchases
 
 
 def build_proposal(prices: pd.DataFrame, quantities: pd.Series, cash: float,
-                   config: AllocationConfig, train_days: int, cost_bps: float) -> dict:
+                   config: AllocationConfig, train_days: int, cost_bps: float, *,
+                   instrument_types: dict[str, str] | None = None,
+                   purchases: pd.DataFrame | None = None) -> dict:
     if not quantities.index.is_unique or set(quantities.index) - set(prices.columns):
         raise ValueError("Holdings contain unknown or duplicate symbols.")
     quantities = quantities.reindex(prices.columns).fillna(0).astype(float)
-    if not np.isfinite(quantities).all() or (quantities < 0).any() or not np.equal(quantities, np.floor(quantities)).all():
-        raise ValueError("Holdings must be non-negative whole-share quantities.")
+    types = pd.Series(instrument_types or {}, dtype=object).reindex(prices.columns).fillna("Stock")
+    if not types.isin(INSTRUMENT_TYPES).all() or set(instrument_types or {}) - set(prices.columns):
+        raise ValueError("Instrument types must cover known symbols with Stock or Mutual fund.")
+    whole = quantities[types == "Stock"]
+    if not np.isfinite(quantities).all() or (quantities < 0).any() or not np.equal(whole, np.floor(whole)).all():
+        raise ValueError("Holdings must be non-negative; stocks require whole shares.")
+    purchase_book = None
+    if purchases is not None:
+        purchase_book = value_purchases(purchases, prices.iloc[-1], prices.index[-1])
+        positions = purchase_book["positions"]
+        if not np.allclose(positions.quantity.reindex(quantities.index).fillna(0), quantities, rtol=0, atol=1e-9):
+            raise ValueError("Purchase lots do not match current quantities.")
+        if not (positions.instrument_type.to_numpy() == types.reindex(positions.index).to_numpy()).all():
+            raise ValueError("Purchase lots do not match instrument types.")
     if not np.isfinite(cash) or cash < 0:
         raise ValueError("Available cash must be non-negative.")
     last = prices.iloc[-1].astype(float)
@@ -36,7 +51,9 @@ def build_proposal(prices: pd.DataFrame, quantities: pd.Series, cash: float,
     decision = latest_decision(prices, config, train_days, current, cost_bps)
     weights = decision["weights"]
     fee_rate = rebalance_cost_rate(weights, current, cost_bps)
-    target_quantity = np.floor(weights.reindex(last.index).clip(lower=0) * capital * (1 - fee_rate) / last).astype(int)
+    increments = pd.Series(np.where(types == "Mutual fund", .000001, 1.0), index=last.index)
+    raw_quantity = weights.reindex(last.index).clip(lower=0) * capital * (1 - fee_rate) / last
+    target_quantity = np.floor(raw_quantity / increments) * increments
     delta = target_quantity - quantities
     notional = delta * last
     fees = notional.abs() * cost_bps / 10000
@@ -51,16 +68,21 @@ def build_proposal(prices: pd.DataFrame, quantities: pd.Series, cash: float,
     checks = pd.concat([checks, pd.DataFrame([{"check": "Cash funding", "value": remaining_cash,
                                              "limit": 0.0, "passed": remaining_cash >= -1e-7}])], ignore_index=True)
     reasons = []
+    ineligible = set(decision.get("ineligible", []))
     for symbol in last.index:
-        if delta[symbol] == 0:
-            reasons.append("No whole-share change")
+        if symbol in ineligible:
+            reasons.append("Listed too recently for the risk model to size (needs "
+                           f"{MIN_LISTING_HISTORY_DAYS} sessions of history); held at zero target")
+        elif delta[symbol] == 0:
+            reasons.append("No unit change")
         elif decision["effective_method"] == "ML mean-variance":
             reasons.append("Validated forecast; costs and portfolio limits applied")
         else:
             reasons.append(f"{decision['effective_method']} target; portfolio limits applied")
     trades = pd.DataFrame({"symbol": last.index, "reference_price": last.to_numpy(),
-                           "current_quantity": quantities.to_numpy().astype(int),
-                           "target_quantity": target_quantity.to_numpy(), "trade_quantity": delta.to_numpy().astype(int),
+                           "instrument_type": types.to_numpy(), "unit_increment": increments.to_numpy(),
+                           "current_quantity": quantities.to_numpy(),
+                           "target_quantity": target_quantity.to_numpy(), "trade_quantity": delta.to_numpy(),
                            "action": np.where(delta > 0, "Buy", np.where(delta < 0, "Sell", "Hold")),
                            "trade_value": notional.to_numpy(), "estimated_fee": fees.to_numpy(),
                            "current_weight": current.reindex(last.index).to_numpy(),
@@ -68,7 +90,8 @@ def build_proposal(prices: pd.DataFrame, quantities: pd.Series, cash: float,
                            "rounded_weight": rounded.reindex(last.index).to_numpy(), "reason": reasons})
     return {"decision": decision, "trades": trades, "checks": checks, "accepted": bool(checks.passed.all()),
             "capital": capital, "estimated_fees": float(fees.sum()), "cash_after": remaining_cash,
-            "capital_after": after_capital, "current_weights": current, "rounded_weights": rounded}
+            "capital_after": after_capital, "current_weights": current, "rounded_weights": rounded,
+            "purchase_book": purchase_book}
 
 
 def _json_value(value):
@@ -95,15 +118,14 @@ def save_proposal(root: Path, proposal: dict, prices: pd.DataFrame,
         raise ValueError("A proposal with failed risk checks cannot be saved as accepted.")
     root.mkdir(parents=True, exist_ok=True)
     key = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "_" + uuid4().hex[:12]
-    payload = {"schema_version": 1, "id": key, "saved_at": datetime.now(timezone.utc),
+    digest = price_key(prices)
+    price_path = root / "prices" / f"{digest}.parquet"
+    if not price_path.exists():
+        atomic_parquet(prices, price_path)
+    payload = {"schema_version": 2, "kind": "proposal", "id": key, "saved_at": datetime.now(timezone.utc),
                "allocation_config": asdict(config), "train_days": train_days, "cost_bps": cost_bps,
-               "price_hash": hashlib.sha256(pd.util.hash_pandas_object(prices, index=True).values.tobytes()
-                                             + repr(list(prices.columns)).encode()).hexdigest(),
-               "prices": prices.rename_axis("date").reset_index(), "proposal": proposal}
-    path = root / f"{key}.json"
-    with path.open("x", encoding="utf-8") as handle:
-        json.dump(_json_value(payload), handle, allow_nan=False, indent=2)
-    return path
+               "price_hash": digest, "prices": {"$table": f"prices/{digest}.parquet"}, "proposal": proposal}
+    return write_artifact(root, key, payload)
 
 
 def saved_proposals(root: Path, latest_prices: pd.Series, as_of: pd.Timestamp,
@@ -112,9 +134,17 @@ def saved_proposals(root: Path, latest_prices: pd.Series, as_of: pd.Timestamp,
     for path in sorted(root.glob("*.json"), reverse=True):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
+            if payload.get("kind", "proposal") != "proposal":
+                continue
             proposal = payload["proposal"]
             decision = proposal["decision"]
-            trades = pd.DataFrame(proposal["trades"])
+            if payload.get("schema_version") == 2:
+                trades = read_table(root, proposal["trades"],
+                                    columns=["symbol", "target_quantity", "reference_price"])
+                decision = dict(decision, as_of=decision["as_of"]["$timestamp"])
+                payload["saved_at"] = payload["saved_at"]["$timestamp"]
+            else:
+                trades = pd.DataFrame(proposal["trades"])
             symbols = trades.symbol.tolist()
             comparable = set(symbols).issubset(latest_prices.index) and as_of >= pd.Timestamp(decision["as_of"])
             if comparable and price_history is not None:

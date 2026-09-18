@@ -52,6 +52,9 @@ _REPO_RATE_HISTORY: list[tuple[str, float]] = [
     ("2025-02-07", 6.25),
     ("2025-04-09", 6.00),
     ("2025-06-06", 5.50),
+    ("2025-12-05", 5.25),
+    # Oct 2025 and every 2026 MPC meeting through Aug 2026 held rate unchanged at 5.25%.
+    # Verified against RBI MPC press releases 2026-09-12 - re-check periodically.
 ]
 
 

@@ -54,7 +54,6 @@ def run(
                     df,
                     cfg.fundamentals_dir / name / f"{sym}.parquet",
                     primary_key=pk,
-                    merge=False,
                 )
             manifest.mark_done(sym, total)
         except Exception as exc:  # noqa: BLE001

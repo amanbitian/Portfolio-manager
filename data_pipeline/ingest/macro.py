@@ -39,7 +39,6 @@ def run(cfg: PipelineConfig, *, force: bool = False, **_: object) -> None:
                 cfg.macro_dir / "worldbank" / f"{country}_{_safe_name(code)}.parquet",
                 primary_key=["series_id", "date"],
                 sort_by=["date"],
-                merge=False,
             )
             manifest.mark_done(key, rows)
             LOG.info("macro %s: %d rows", key, rows)
@@ -60,7 +59,6 @@ def run(cfg: PipelineConfig, *, force: bool = False, **_: object) -> None:
                     cfg.macro_dir / "fred" / f"{series_id}.parquet",
                     primary_key=["series_id", "date"],
                     sort_by=["date"],
-                    merge=False,
                 )
                 manifest.mark_done(key, rows)
             except Exception as exc:  # noqa: BLE001
@@ -77,7 +75,6 @@ def run(cfg: PipelineConfig, *, force: bool = False, **_: object) -> None:
             cfg.macro_dir / "rbi" / "REPO_RATE.parquet",
             primary_key=["series_id", "date"],
             sort_by=["date"],
-            merge=False,
         )
         manifest.mark_done("rbi:REPO_RATE", rows)
     except Exception as exc:  # noqa: BLE001

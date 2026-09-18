@@ -84,7 +84,6 @@ def run(
                 cfg.news_dir / "gdelt" / f"symbol={sym}" / f"{y:04d}-{m:02d}.parquet",
                 primary_key=["symbol", "url"],
                 sort_by=["seendate"],
-                merge=False,
             )
             manifest.mark_done(key, rows)
         except Exception as exc:  # noqa: BLE001

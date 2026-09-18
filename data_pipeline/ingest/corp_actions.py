@@ -41,7 +41,6 @@ def run(
                 cfg.corp_actions_dir / f"{sym}.parquet",
                 primary_key=["symbol", "ex_date", "action_type"],
                 sort_by=["ex_date"],
-                merge=False,
             )
             manifest.mark_done(sym, rows)
         except Exception as exc:  # noqa: BLE001

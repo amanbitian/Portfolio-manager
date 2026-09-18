@@ -53,6 +53,7 @@ class PipelineConfig:
             "worldbank": RateLimit(rps=5.0),
             "nse": RateLimit(rps=1.0),
             "niftyindices": RateLimit(rps=1.0),
+            "mfapi": RateLimit(rps=10.0),       # community-run free API; no published limit, just asks callers to cache
             "yfinance": RateLimit(rps=1.5),
             "assets": RateLimit(rps=2.0),
             "screener": RateLimit(rps=0.22),   # be gentle: ~1 request / 4.5s
@@ -101,6 +102,10 @@ class PipelineConfig:
     @property
     def screener_parquet_dir(self) -> Path:
         return self.fundamentals_dir / "screener"
+
+    @property
+    def shareholding_dir(self) -> Path:
+        return self.fundamentals_dir / "shareholding"
 
     def ohlcv_dir(self, interval: str) -> Path:
         return self.market_dir / f"ohlcv_{interval}"

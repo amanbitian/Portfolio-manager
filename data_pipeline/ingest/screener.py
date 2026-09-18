@@ -104,7 +104,6 @@ def run(
                     cfg.screener_parquet_dir / section / f"{sym}.parquet",
                     primary_key=["symbol", "period_end", "freq", "statement", "line_item"],
                     sort_by=["statement", "period_end", "line_item"],
-                    merge=False,
                 )
             manifest.mark_done(key, total)
             processed += 1

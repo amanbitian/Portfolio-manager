@@ -5,8 +5,10 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
+from scipy.linalg import cholesky
 
 METHODS = ("ML mean-variance", "Equal weight", "Inverse volatility", "Minimum variance")
+LARGE_UNIVERSE_ASSET_LIMIT = 250
 
 
 @dataclass(frozen=True)
@@ -21,6 +23,7 @@ class AllocationConfig:
     min_trade_benefit_bps: float = 0.0
     sectors: dict[str, str] = field(default_factory=dict)
     sector_caps: dict[str, float] = field(default_factory=dict)
+    solver_backend: str = "auto"
 
 
 class AllocationError(ValueError):
@@ -32,6 +35,17 @@ def _clean_covariance(covariance: pd.DataFrame, symbols: list[str]) -> np.ndarra
     if not np.isfinite(cov).all():
         raise AllocationError("Covariance must be finite and cover every asset.")
     cov = (cov + cov.T) / 2
+    if len(symbols) > LARGE_UNIVERSE_ASSET_LIMIT:
+        diagonal = np.diag(cov)
+        if (diagonal < -1e-12).any():
+            raise AllocationError("Covariance diagonal must be non-negative.")
+        np.fill_diagonal(cov, np.maximum(diagonal, 1e-10))
+        if np.count_nonzero(cov) > len(symbols):
+            try:
+                cholesky(cov + np.eye(len(symbols)) * 1e-10, check_finite=False)
+            except np.linalg.LinAlgError as exc:
+                raise AllocationError("Covariance must be positive semidefinite.") from exc
+        return cov
     values, vectors = np.linalg.eigh(cov)
     if values.min() < -1e-7:
         raise AllocationError("Covariance must be positive semidefinite.")
@@ -39,6 +53,8 @@ def _clean_covariance(covariance: pd.DataFrame, symbols: list[str]) -> np.ndarra
 
 
 def validate_config(config: AllocationConfig) -> None:
+    if config.solver_backend not in ("auto", "slsqp", "convex"):
+        raise AllocationError("Unknown solver backend.")
     if config.method not in METHODS:
         raise AllocationError(f"Unknown strategy: {config.method}")
     for name in ("max_weight", "cash_weight", "max_turnover"):
@@ -90,7 +106,11 @@ def risk_checks(weights: pd.Series, covariance: pd.DataFrame, config: Allocation
     if config.max_volatility is not None:
         add("Annual volatility", vol, config.max_volatility, vol <= config.max_volatility + 1e-6)
     if current is not None:
-        old = normalize_holdings(current, symbols)
+        # `symbols` is the covariance's universe, which the decision layer may
+        # have narrowed to the investable names (decisions.MIN_LISTING_HISTORY_DAYS);
+        # a holding outside it is being sold, and that leg is real turnover.
+        held = [s for s in current.index if s != "CASH" and s not in set(symbols)]
+        old = normalize_holdings(current, symbols + held)
         turnover = float((weights.reindex(old.index).fillna(0) - old).abs().sum() / 2)
         add("One-way turnover", turnover, config.max_turnover, turnover <= config.max_turnover + 1e-6)
     for sector, cap in config.sector_caps.items():
@@ -134,6 +154,30 @@ def allocate_portfolio(expected_returns: pd.Series, covariance: pd.DataFrame,
     n = len(symbols)
     old = normalize_holdings(current_weights, symbols)
     cov = _clean_covariance(covariance, symbols)
+    risk_model_label = covariance.attrs.get("approximation", "full covariance")
+    factor_structure = None
+    if risk_model_label == "factor" and "loadings" in covariance.attrs:
+        # Reindex to `symbols` order exactly like _clean_covariance does for the
+        # dense matrix, so the solver's low-rank formulation (see convex.py)
+        # stays consistent even if `symbols` isn't already in covariance.index order.
+        loadings_frame = pd.DataFrame(covariance.attrs["loadings"], index=covariance.index).reindex(symbols)
+        specific_series = pd.Series(covariance.attrs["specific_variance"], index=covariance.index).reindex(symbols)
+        factor_structure = {
+            "loadings": loadings_frame.to_numpy(),
+            "factor_variance": covariance.attrs["factor_variance"],
+            "specific_variance": specific_series.to_numpy(),
+        }
+    def convex_fallback(reason):
+        from .convex import allocate_convex
+        weights = allocate_convex(mu, cov, trailing_returns, config, symbols, old, transaction_cost_bps,
+                                  risk_model_label=risk_model_label, factor_structure=factor_structure)
+        weights.attrs["solver"]["fallback_reason"] = reason
+        return weights
+
+    if config.solver_backend == "convex" or (config.solver_backend == "auto" and n > LARGE_UNIVERSE_ASSET_LIMIT):
+        from .convex import allocate_convex
+        return allocate_convex(mu, cov, trailing_returns, config, symbols, old, transaction_cost_bps,
+                               risk_model_label=risk_model_label, factor_structure=factor_structure)
     target = min(1 - config.cash_weight, n * config.max_weight)
     raw = np.ones(n)
     if config.method == "Inverse volatility":
@@ -189,6 +233,8 @@ def allocate_portfolio(expected_returns: pd.Series, covariance: pd.DataFrame,
         full_budget_feasible = (budget_result.x[:n].sum() >= target - 1e-7
                                 and all(np.min(c["fun"](budget_result.x)) >= -1e-7 for c in constraints))
         if not budget_result.success and not full_budget_feasible:
+            if config.solver_backend == "auto":
+                return convex_fallback(str(budget_result.message))
             raise AllocationError(f"Risk and turnover limits are incompatible: {budget_result.message}")
         # Budget slack avoids a singular feasible set tangent to the risk ceiling.
         budget = max(0.0, float(budget_result.x[:n].sum()) - 1e-7)
@@ -208,7 +254,13 @@ def allocate_portfolio(expected_returns: pd.Series, covariance: pd.DataFrame,
     weights = pd.Series(np.r_[risky, max(0, 1 - risky.sum())], index=symbols + ["CASH"])
     checks = risk_checks(weights, covariance, config, old)
     if not result.success or not checks["passed"].all():
+        if config.solver_backend == "auto":
+            return convex_fallback(str(result.message))
         raise AllocationError("No accepted allocation for these limits. Check turnover against required risk reductions. "
                               f"Solver: {result.message}")
-    weights.attrs["solver"] = {"converged": True, "iterations": int(result.nit), "objective": float(result.fun)}
+    weights.attrs["solver"] = {
+        "converged": True, "iterations": int(result.nit), "objective": float(result.fun),
+        "mode": "scipy_slsqp", "backend": "SLSQP", "assets": n,
+        "risk_model": covariance.attrs.get("approximation", "full covariance"),
+    }
     return weights

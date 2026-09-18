@@ -126,9 +126,25 @@ def main(argv: list[str] | None = None) -> int:
     p_news.add_argument("--limit", type=int)
     p_news.add_argument("--years", type=int, help="GDELT backfill window")
 
+    p_sh = sub.add_parser("shareholding", help="NSE shareholding pattern (promoter/public %%)")
+    p_sh.add_argument("--symbols")
+    p_sh.add_argument("--limit", type=int)
+    p_sh.add_argument("--workers", type=int, default=8, help="parallel fetch workers")
+
+    p_mf = sub.add_parser("mutual-funds", help="AMFI mutual fund NAV history via mfapi.in")
+    p_mf.add_argument("--limit", type=int)
+    p_mf.add_argument("--workers", type=int, default=10, help="parallel fetch workers")
+    p_mf.add_argument("--refresh-after-days", type=float,
+                      help="re-fetch a scheme already marked done if its last fetch is older than this many days "
+                           "(mfapi always returns full history to today, so a 'done' scheme otherwise never "
+                           "picks up newly published NAVs on a later run)")
+
     p_cc = sub.add_parser("news-cc", help="historical news from Common Crawl (2017+)")
     p_cc.add_argument("--phase", choices=["catalog", "fetch", "both"], default="both")
-    p_cc.add_argument("--since", type=int, default=2017, help="earliest crawl year")
+    p_cc.add_argument("--since", type=int, default=2017,
+                      help="earliest crawl year to catalog, and/or to prioritize when fetching "
+                           "(fetch is otherwise oldest-first, which can starve recent years "
+                           "behind a large backlog)")
     p_cc.add_argument("--domains", help="comma list: et,bs,mint,hbl,mc,fe,bt")
     p_cc.add_argument("--limit", type=int, help="max articles to fetch this run")
     p_cc.add_argument("--workers", type=int, default=6, help="parallel fetch workers")
@@ -202,6 +218,19 @@ def main(argv: list[str] | None = None) -> int:
                 limit=args.limit,
                 years=args.years,
             )
+    elif args.cmd == "shareholding":
+        from .ingest import shareholding
+
+        shareholding.run(
+            cfg,
+            symbols=_split_symbols(args.symbols),
+            limit=args.limit,
+            workers=args.workers,
+        )
+    elif args.cmd == "mutual-funds":
+        from .ingest import mutual_funds
+
+        mutual_funds.run(cfg, limit=args.limit, workers=args.workers, refresh_after_days=args.refresh_after_days)
     elif args.cmd == "news-cc":
         from .ingest import news_cc
 

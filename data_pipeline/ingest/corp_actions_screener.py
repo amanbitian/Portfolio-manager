@@ -48,6 +48,12 @@ def run(
             derived = derive_actions(pd.read_parquet(bs_path), sym)
             ca_path = cfg.corp_actions_dir / f"{sym}.parquet"
             existing = pd.read_parquet(ca_path) if ca_path.exists() else pd.DataFrame()
+            if not existing.empty:
+                # Screener-derived rows are always fully recomputed from the current
+                # balance sheet below - drop the old ones first so a parser/logic fix
+                # actually corrects previously-written data on the next run, instead
+                # of a stale bad row surviving forever next to the corrected one.
+                existing = existing[existing["source"] != "screener_derived"]
             n_before = len(existing)
             combined = merge_actions(existing, derived)
             n_new = max(len(combined) - n_before, 0)

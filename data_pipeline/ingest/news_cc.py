@@ -198,7 +198,7 @@ def _process_one(rec: dict, sess) -> dict | None:
     }
 
 
-def fetch(cfg: PipelineConfig, limit: int | None, workers: int) -> None:
+def fetch(cfg: PipelineConfig, limit: int | None, workers: int, since: int | None = None) -> None:
     base = _cc_dir(cfg)
     cat_files = sorted((base / _CATALOG).glob("*.parquet"))
     if not cat_files:
@@ -209,11 +209,18 @@ def fetch(cfg: PipelineConfig, limit: int | None, workers: int) -> None:
     cat = cat.sort_values("timestamp").drop_duplicates("url", keep="first")
     done = _done_urls(cfg)
     todo = cat[~cat["url"].isin(done)]
+    if since:
+        # Fetch is otherwise oldest-crawl-first; with a large backlog that can
+        # starve recent years for a very long time. --since lets a run target
+        # newer captures directly without waiting out the whole older backlog
+        # (a separate unfiltered run later still picks up whatever's left).
+        todo = todo[todo["timestamp"].str[:4].astype(int) >= since]
     if limit:
         todo = todo.head(limit)
     LOG.info(
-        "news-cc fetch: %d unique catalogued, %d done, %d to fetch (%d workers)",
+        "news-cc fetch: %d unique catalogued, %d done, %d to fetch (%d workers)%s",
         len(cat), len(done), len(todo), workers,
+        f", since {since}" if since else "",
     )
     if todo.empty:
         return
@@ -344,4 +351,4 @@ def run(
     if phase in ("catalog", "both"):
         catalog(cfg, since, dkeys)
     if phase in ("fetch", "both"):
-        fetch(cfg, limit, workers)
+        fetch(cfg, limit, workers, since=since)
