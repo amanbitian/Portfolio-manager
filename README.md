@@ -17,6 +17,8 @@ The backtester evaluates the strategy after costs.
 - Performs walk-forward backtesting with label cutoffs that prevent future-return leakage.
 - Simulates buy-and-hold weight drift between rebalance dates.
 - Shows equity curves, drawdowns, final allocations, forecast diagnostics, and risk metrics.
+- Includes an Options Strategy Lab for editable multi-leg payoff, Greeks, stress scenarios, and hedge analysis.
+- Maintains one persistent local paper-trading account for stocks and, when the data-lake catalog exists, mutual funds.
 
 ## Project Structure
 
@@ -27,11 +29,22 @@ The backtester evaluates the strategy after costs.
   README.md
   requirements.txt
   tests/
-    engine_checks.py
-    app_logic_checks.py
-    ui_checks.py
-    optimization_checks.py
     agent_copilot_checks.py
+    app_logic_checks.py
+    data_generation_checks.py
+    engine_checks.py
+    indicator_checks.py
+    ledger_checks.py
+    market_data_checks.py
+    optimization_checks.py
+    options_checks.py
+    pipeline_checks.py
+    purchase_checks.py
+    reporting_checks.py
+    research_registry_checks.py
+    risk_model_checks.py
+    robustness_checks.py
+    ui_checks.py
   src/
     ml_portfolio/
       __init__.py
@@ -42,14 +55,20 @@ The backtester evaluates the strategy after costs.
       execution.py
       experiments.py
       features.py
+      holdings.py
+      ledger.py
+      market_data.py
       models.py
       optimizers.py
+      options.py
       portfolio.py
       reporting.py
       research_agent.py
+      research_registry.py
+      robustness.py
       storage.py
       strategy_copilot.py
-  data_pipeline/          real-data ingestion (prices, fundamentals, macro, news) - see below
+  data_pipeline/          real-data ingestion (prices, funds, fundamentals, macro, news) - see below
   scripts/                scheduled-task / monitoring helpers for data_pipeline
 ```
 
@@ -75,10 +94,13 @@ to cash there. Both sets are listed in the coverage expander. The universe refle
 constituent changes and delisted-in-the-past names are not available (survivorship
 bias), and this is stated in the UI, not hidden.
 
-Not yet wired: mutual fund NAVs (needs a different search UI for 37,882 schemes),
-and fundamentals/macro/news (the pipeline has no point-in-time/availability layer yet -
-see `data_pipeline/DATA.md` - so joining them into a backtest today would carry
-look-ahead bias). Corporate actions can be read via
+The Paper Trading workspace uses the pre-built mutual-fund catalog when it exists,
+filters it to recently updated Direct Plan/Growth schemes, and loads an individual
+scheme's NAV history on demand. Mutual funds are not yet a selectable universe for
+the optimizer, Research, or Research Agent. Fundamentals, macro, and news are also
+not wired into those models because the pipeline has no complete point-in-time/
+availability layer yet - see `data_pipeline/DATA.md`; joining them to a historical
+backtest today would carry look-ahead risk. Corporate actions can be read via
 `ml_portfolio.market_data.load_corporate_actions` for display/audit, but are not wired
 into any purchase-ledger cost-basis accounting.
 
@@ -104,7 +126,43 @@ Run the app:
 streamlit run app.py
 ```
 
-The app starts with synthetic market data, so no external data source is required. Version 1 runs without Docker and without a database.
+The app starts with synthetic market data, so no external data source is required. It runs without Docker and without a database.
+
+## Workspace Map
+
+| Workspace | Implemented role | Primary inputs |
+|---|---|---|
+| Portfolio | Holdings entry, constrained allocation proposal, trade preview, and saved decision | Loaded daily price/NAV matrix |
+| Paper Trading | Persistent virtual account, browsing, watchlist, latest-loaded-price fills, holdings, and P&L | Its own real/synthetic/upload selector; optional AMFI catalog/NAVs |
+| Options Lab | Editable multi-leg theoretical pricing, Greeks, payoff, hedge, and scenarios | Manual option assumptions; no option-chain feed |
+| Research | Four-method walk-forward comparison and diagnostics | Loaded daily price/NAV matrix |
+| Research Agent | Deterministic price-led symbol/peer brief and testable hypothesis | Loaded daily price/NAV matrix |
+| Strategy Copilot | Validated strategy DSL, backtest, and bounded parameter sweep | Loaded daily price/NAV matrix |
+| Saved Decisions | Reopen saved proposals, comparisons, reports, strategy runs, and sweeps | `experiments/` artifacts plus current prices for comparisons |
+| Research Registry | Filter/tag research artifacts and run Copilot robustness checks | Research kinds in `experiments/`; operational accounts are excluded |
+
+## Options Strategy Lab
+
+The **Options Lab** workspace is independent of the app's stock/NAV price dataset. Choose a strategy
+template, edit its legs, and change spot, expiry, IV, rates, lot size, and strike
+spacing to recalculate theoretical premiums, expiry payoff, breakevens, Greeks,
+delta-hedge units, and spot/IV scenario P&L. It uses Black–Scholes assumptions rather
+than a live option chain and does not submit orders.
+
+Available templates are Long Straddle, Long Strangle, Iron Condor, Call Butterfly,
+Batman (two adjacent call butterflies), and Custom. The editable leg table supports
+adding or removing calls and puts. The engine reports per-leg and portfolio delta,
+gamma, calendar-day theta, and vega per one volatility point, plus entry debit/credit,
+bounded or unbounded risk, risk-neutral probability of profit, expected expiry P&L,
+a point-in-time delta-neutral underlying hedge, and mark-to-model spot/IV scenarios.
+
+The Objective selector is display context only; it does not recommend or optimize a
+strategy. The lab has no option-chain feed, volatility surface, American early-exercise
+model, margin engine, bid/ask spread, slippage, taxes, assignment, liquidity, or broker
+connection. Its values are theoretical research outputs, not executable quotes, and
+the only export is a CSV of the displayed legs and analytics.
+
+## Testing
 
 Run the local engine checks:
 
@@ -121,6 +179,10 @@ python tests/market_data_checks.py
 python tests/ledger_checks.py
 python tests/reporting_checks.py
 python tests/risk_model_checks.py
+python tests/research_registry_checks.py
+python tests/robustness_checks.py
+python tests/options_checks.py
+python tests/pipeline_checks.py
 ```
 
 Test files use a `*_checks.py` naming convention, not `test_*.py` - running each
@@ -243,6 +305,65 @@ Sweeps can be saved and reopened from Saved Decisions, replaying exactly what wa
 tested and selected without recomputing anything with knowledge the original run
 didn't have.
 
+## Research Registry
+
+Every saved proposal, research run, research report, Strategy Copilot run, and
+parameter sweep can optionally be tagged with a research question, a
+hypothesis, a status (`unlabeled`/`supported`/`falsified`/`inconclusive`), a
+conclusion, and a parent experiment id - metadata attached to the artifact's
+own manifest (`ml_portfolio.research_registry`), not a separate database. An
+optional "Tag with research context" control sits next to every Save button;
+leaving it blank changes nothing about existing save behavior. Where the
+surrounding view already has a natural default - the Research Agent's own
+question and hypothesis title, the Strategy Copilot's prompt - it's applied
+automatically, and a Strategy Copilot run saved from "Use hypothesis in
+Strategy Copilot" links its `parent_id` to the source research report.
+
+The Research Registry workspace lists every saved experiment in one table,
+filterable by kind and status, with summary counts, and lets a status,
+conclusion, or parent link be set or revised after the fact - whether a
+result is supported or falsified is usually a conclusion reached on review,
+not something known at save time. Operational artifacts (the real paper
+trading account, purchase portfolios, transaction ledgers) are excluded from
+the registry; it tracks research, not holdings.
+
+This is deliberately just a metadata layer on the existing artifact store,
+not a new database or a knowledge graph - see Next Steps for what a fuller
+research-graph build-out would add on top of it. Its status field can now be
+set automatically from evidence - see Robustness / Falsification Checks below
+- as well as by hand.
+
+## Robustness / Falsification Checks
+
+`ml_portfolio.robustness` reruns a saved Strategy Copilot run (`kind=
+"strategy_run"`) under stress and reports a structured evidence bundle
+instead of a single headline Sharpe: cost stress (the same strategy at 2x/3x
+its transaction cost), chronological sub-periods (does the result hold up
+across the whole window, or was it one lucky stretch), parameter
+perturbation (rerunning the template's own numeric fields at +/-20%, since a
+result that only exists at one exact parameter value is weak evidence),
+a randomized-selection placebo (the same rebalance schedule, costs, and
+weighting, but picking assets uniformly at random instead of by signal - if
+random picks perform comparably, the apparent edge isn't coming from the
+signal), and a moving-block bootstrap confidence interval on Sharpe.
+
+From the Research Registry page, selecting a saved strategy run and clicking
+"Run robustness checks" runs all of the above and shows a transparent,
+rule-based verdict (`supported`/`falsified`/`inconclusive`, from a count of
+which of five specific checks passed - never an opaque AI-generated score).
+Saving the result persists a `robustness_report` artifact (linked to the
+strategy run it evaluated via `source_strategy_run_id`/`parent_id`, the same
+lineage convention research reports and strategy runs already use) and
+writes the verdict directly into the strategy run's own Research Registry
+status and conclusion fields.
+
+This intentionally targets only the DSL-backed Strategy Copilot engine, not
+the ML allocator or the Research view's four-method comparison: the DSL's
+parameters are small, numeric, and template-typed, which is what makes
+"perturb by +/-20%" a well-defined operation without guessing at what a
+parameter change means for a fitted model. Extending equivalent checks to
+the ML allocator is tracked in Next Steps.
+
 ## Purchase Portfolios
 
 Portfolio now has Quantities and Purchases entry modes. Purchases records a symbol,
@@ -260,7 +381,9 @@ Stocks require whole shares. Mutual funds accept fractional holdings; proposed t
 units are rounded down to six decimals. Actual fund allotments, redemption rules, fees,
 and settlement NAVs are not modeled. Purchase dates cannot exceed the loaded valuation
 date; symbols must exist in the loaded price/NAV dataset. This adds app support for
-fund holdings but does not automatically connect the separate mutual-fund data pipeline.
+fund holdings. The Portfolio purchase editor still requires fund symbols/NAVs to be
+present in the dataset loaded for that workspace; only Paper Trading currently browses
+the separate AMFI mutual-fund catalog directly.
 
 Purchases-mode entries represent remaining open lots, not a complete transaction
 ledger (kept unchanged - see Transactions below for sells/cash flows/XIRR). Cost
@@ -295,6 +418,31 @@ lock-in/exit-load modeling, and tax reporting (`todo.md` treats tax as a separat
 jurisdiction-specific future feature). The existing Purchases (open-lot,
 buy-only) mode is untouched and remains a valid simpler path for a buy-and-hold
 portfolio that has never sold.
+
+## Paper Trading
+
+Paper Trading is an operational sandbox separate from the optimizer and backtests. It
+has its own data controls and defaults to **Real data (data lake)**, loading the current
+stock universe over a recent roughly 150-calendar-day window. Synthetic demo prices
+and uploaded CSV prices are also supported. When
+`reference/mutual_fund_catalog.parquet` exists, the page adds a Mutual Funds browser
+limited to Direct Plan/Growth schemes whose catalog NAV is no more than 45 days behind
+the catalog's newest observation; full NAV history is loaded from the selected
+scheme's Parquet file only when needed.
+
+One fixed local account is stored as the `paper_trading_account` artifact under
+`experiments/`. The page provides stock/fund search, watchlist, holdings, orders,
+realized FIFO trades, cash funding, and account reset. A paper buy or sell fills
+immediately at the latest loaded close or NAV. The shared ledger rejects negative
+cash and sells larger than the open position, values open positions, and separates
+realized from unrealized P&L. Mutual-fund buys accept a currency amount and derive
+fractional units; stock orders use whole quantities.
+
+This is not exchange simulation or live execution. There is no broker connection,
+order book, intraday clock, pending/partial fill, bid/ask spread, slippage, brokerage,
+tax, settlement, fund exit-load/lock-in, corporate-action lot adjustment, or margin.
+"Today's P&L" means change from the two latest loaded observations, which may be
+historical or synthetic rather than today's calendar date.
 
 ## Implemented Methods
 
@@ -374,11 +522,13 @@ or unavailable files cause recomputation. The disposable cache is limited to 2 G
 using oldest-accessed-file eviction. Python callers can pass `cache_dir=None` to
 `build_context` or backtest functions to disable disk caching.
 
-Accepted proposals, explicitly saved research runs, saved Strategy Copilot runs,
-purchase portfolios, and transaction ledgers all live under `experiments/`, each
-distinguished by its artifact `kind`. Keep the entire directory when backing up or
-moving experiments: manifests reference their Parquet tables and shared `prices/`
-files. Automatic cache eviction never removes
+Accepted proposals, research comparisons, research reports, Strategy Copilot runs,
+parameter sweeps, robustness reports, purchase portfolios, transaction ledgers, and
+the fixed-key paper account all live under `experiments/`, each distinguished by its
+artifact `kind`. The Research Registry intentionally excludes the operational purchase,
+ledger, and paper-account kinds. Keep the entire directory when backing up or moving
+artifacts: manifests reference their Parquet tables and shared `prices/` files.
+Automatic cache eviction never removes
 experiments. `ml_portfolio.storage.load_artifact(path)` restores new artifacts as Pandas
 objects. Neither persistence layer requires DuckDB, Docker, or a database service.
 
@@ -431,7 +581,22 @@ No output from this app should be treated as financial advice.
 - Add configurable risk-free/cash yields and fill/slippage models.
 - Extend validation to multiple market periods and confidence reliability plots.
 - Add stress tests for cost assumptions, rebalance frequency, and market regimes.
-- Add DuckDB queries across saved experiments when cross-run analysis warrants it.
+- Add DuckDB queries across saved experiments when cross-run analysis warrants it -
+  the Research Registry's tagging/listing is the metadata layer that would feed it,
+  not a replacement for it.
+- Extend the robustness/falsification engine's checks (cost stress, sub-periods,
+  parameter perturbation, randomized-signal placebo, bootstrap CI) to the ML
+  allocator and the Research view's four-method comparison - today it only covers
+  Strategy Copilot's DSL-backed runs, whose small numeric template parameters are
+  what make "perturb by +/-20%" well-defined without guessing at a fitted model.
+- Add multiple-testing correction (deflated/probabilistic Sharpe, false discovery
+  rate) once experiments are run in enough volume that one looking good by chance
+  becomes a real risk, not just a theoretical one.
+- Add a historical option-chain source, implied-volatility surface/skew, realistic
+  bid/ask and fee models, margin, and event-driven options backtesting before using
+  Options Lab structures for historical claims or execution decisions.
+- Add pending/partial fills, configurable slippage and fees, and explicit market-data
+  freshness to Paper Trading before treating it as an execution simulator.
 - Add point-in-time fundamentals, index membership, and stronger ML models after the backtest remains stable on clean price data.
 
 ## Changelog
@@ -1165,3 +1330,158 @@ design principle throughout: a placeholder is never history.
   listings under a year old held, proposing both for sale with the reason shown and
   all risk checks passing.
 - Full suite: 161 tests (152 + 9 new), green on Python 3.14.
+
+### 2026-09-19 — Research Registry: a hypothesis/experiment metadata layer
+
+The user shared a much larger "research think tank" architecture proposal
+(multi-agent orchestration, DuckDB/Parquet analytical layer, a knowledge
+graph, a literature agent, an alpha graveyard, automatic falsification, and
+more) and asked to optimize the app toward it. Given a choice of P0 slices,
+the user picked the one everything else in that proposal depends on: turning
+"a folder of Sharpe ratios" into a place that remembers *why* each saved run
+exists and what was concluded from it - without inventing new infrastructure
+the rest of the proposal would later have to migrate off of.
+
+- *Added `src/ml_portfolio/research_registry.py`*. `set_research_meta`/
+  `get_research_meta` attach a `research` block (research_question,
+  hypothesis, status, conclusion, parent_id) onto an already-saved artifact's
+  manifest, atomically, editing only the small JSON manifest and never the
+  Parquet tables it references. Why in place, not a separate registry
+  database: every saved artifact already carries a schema-versioned envelope
+  (`storage.write_artifact`/`load_artifact`); tagging that same file keeps
+  question-hypothesis-evidence-conclusion as one artifact rather than two
+  records that can drift apart. `list_experiments`/`summarize_experiments`
+  scan `experiments/` and roll every proposal/research run/research
+  report/strategy run/sweep into one table with counts by status and kind -
+  the "N hypotheses: supported/falsified/inconclusive" view the proposal
+  asked for - while explicitly excluding operational artifacts (the real
+  paper trading account, purchase portfolios, transaction ledgers).
+- *Wired into every save site in `app.py`*: an optional "Tag with research
+  context" expander next to each Save button (proposal, research run,
+  research report, strategy run, sweep); left blank, nothing changes about
+  existing save behavior. Where a natural default already exists it's
+  applied automatically - the Research Agent's own question field and its
+  hypothesis title, the Strategy Copilot's prompt - so tagging is opt-in,
+  not mandatory extra data entry. A strategy run saved from "Use hypothesis
+  in Strategy Copilot" also gets `parent_id` set to its source research
+  report, so the registry's lineage field and the existing
+  `source_research_report_id` field agree with each other.
+- *New Research Registry sidebar page*: summary metrics (total experiments,
+  and a count per status), a filterable table of every experiment, and a
+  form to set or revise status/conclusion/parent after the fact - status is
+  deliberately editable post-save, since falsification is usually a
+  conclusion reached on review, not known at the moment a backtest is saved.
+- *Caught and fixed a self-inflicted performance gap before calling this
+  done*: the user asked directly whether the new code was optimized. It
+  wasn't, on two counts - the registry view re-globbed and re-`json.loads`ed
+  every saved manifest's full text on every Streamlit rerun (any filter
+  click, any unrelated form field), and it called `list_experiments` twice
+  per render (`registry_summary` recomputed it internally). Fixed by reusing
+  the app's own existing answer to exactly this class of problem - the
+  `_experiments_fingerprint` + `st.cache_data` pattern `cached_saved_proposals`
+  already established, mirrored as `cached_experiments` - and by splitting
+  `summarize_experiments(frame)` out of `registry_summary(root)` so the view
+  computes the scan once per data change, not once or twice per rerun.
+- 9 new tests (`tests/research_registry_checks.py`): default metadata on a
+  fresh artifact, partial updates leaving other fields untouched, invalid
+  status rejected without partially applying, parent-id lineage between a
+  strategy run and its source report, operational kinds excluded from the
+  registry, a proposal manifest with the `kind` field stripped (mirroring a
+  pre-field-existing legacy save) still defaults to `"proposal"`, and summary
+  counts by status/kind. Full suite: 170 tests, green on Python 3.14.
+- *Scope cuts made explicitly*: this is metadata and listing only - no
+  DuckDB analytical layer, no knowledge graph, no multi-agent orchestration,
+  no automatic robustness/falsification engine, no literature ingestion.
+  Those remain open, tracked in Next Steps, and this layer is what they would
+  build on rather than something they require replacing.
+
+### 2026-09-19 — Automatic robustness/falsification checks for Strategy Copilot runs
+
+A follow-up assessment of the same "research think tank" proposal reprioritized
+its remaining gaps now that the Research Registry existed: point-in-time
+fundamentals and historical index membership were ranked P0, but both need new
+external data sourcing (a licensed historical constituent list, an
+availability-timestamped fundamentals feed) that isn't a code change - the user
+picked the one remaining P0 item buildable today with data already on hand:
+the automatic robustness/falsification engine the Research Registry's status
+field had, until now, only ever been set by hand.
+
+- *Added `src/ml_portfolio/robustness.py`*: `cost_stress` (reruns at 1x/2x/3x
+  the strategy's own transaction cost), `subperiod_analysis` (splits the
+  evaluation window into chronological chunks so a result driven by one lucky
+  stretch looks different from one that holds up throughout), `parameter_
+  perturbation` (reruns each template's own numeric fields, e.g. momentum
+  lookback or RSI period/threshold, at +/-20%), `randomized_placebo` (the same
+  rebalance schedule/costs/weighting, but assets picked uniformly at random
+  instead of by signal - many trials, so a real signal's edge over random
+  picking is directly measurable rather than asserted), and
+  `bootstrap_sharpe_ci` (a moving-block, not i.i.d., bootstrap - blocks
+  preserve short-horizon autocorrelation that resampling single days
+  independently would destroy and understate). `summarize_verdict` turns
+  those into a transparent, rule-based `supported`/`falsified`/`inconclusive`
+  label from a count of five specific pass/fail checks - never an opaque
+  AI-generated score, matching the proposal's own explicit ask ("not an
+  arbitrary AI-generated score, but a structured collection of evidence").
+- *Why scoped to Strategy Copilot only, not the ML allocator or Research's
+  four-method comparison*: the DSL's parameters are small, numeric, and
+  template-typed (a lookback in days, an SMA window pair, an RSI
+  period/threshold) - "perturb by +/-20%" is unambiguous there. The ML
+  allocator's tunable surface (training window, forecast horizon, risk
+  aversion) means something structurally different to perturb and would need
+  its own design, not a shared code path; documented as a scope cut and
+  tracked in Next Steps rather than half-built.
+- *The randomized placebo needed its own execution loop, deliberately not a
+  shared one*: `run_strategy_dsl_backtest`'s signal-to-selection step
+  (`_score_frame`) isn't factored out separately from its walk-forward loop,
+  and this codebase already has precedent (`backtest.py` and
+  `strategy_copilot.py` each keep their own walk-forward loop rather than
+  sharing one) for accepting that duplication over coupling two engines
+  through a private implementation detail. The placebo's loop mirrors the
+  real one's execution mechanics (cost accounting, drift, eligibility
+  masking) exactly, restricting random candidates to names that stay
+  eligible through the end of the coming interval - which makes
+  `liquidate_at_cutoff` correctly inapplicable by construction, not silently
+  skipped. Verified directly: on a fixture with one asset given an
+  unmistakable dominant uptrend against flat/declining noise, real top-1
+  momentum selection scores a materially higher Sharpe than the mean of 30
+  random-pick placebo trials - the check that makes the placebo meaningful,
+  not just present.
+- *Wired into the Research Registry page*: selecting a saved strategy run
+  and clicking "Run robustness checks" runs the full bundle and shows the
+  verdict plus five tabs (cost stress, sub-periods, parameter perturbation,
+  placebo, bootstrap). Saving persists a new `robustness_report` artifact
+  (`kind="robustness_report"`, the same schema-versioned envelope every other
+  saved result already uses) linked to the strategy run via
+  `source_strategy_run_id`, and writes the verdict directly into the
+  strategy run's own Research Registry status and conclusion fields -
+  closing the loop the Research Registry section above describes.
+- 18 new tests (`tests/robustness_checks.py`): cost-multiplier bookkeeping,
+  sub-period splitting (including a too-short split reporting an error row
+  rather than crashing), parameter perturbation covering both directions for
+  every template, the placebo's determinism under a fixed seed and its
+  real-signal-beats-random-pick sanity check, bootstrap CI bracketing its own
+  mean and rejecting too few returns, all three verdict outcomes from
+  directly crafted evidence frames, and a full save/load/registry-listing
+  round trip. Full suite: 188 tests, green on Python 3.14. Also manually
+  smoke-tested the exact call sequence `app.py`'s new UI section uses
+  (save a strategy run, load it back, run checks, save the report, tag the
+  registry) end to end outside Streamlit before wiring the UI.
+
+### 2026-09-22 — Paper Trading workspace and Options Strategy Lab
+
+- Added a persistent paper account backed by the existing transaction-ledger and
+  artifact-store primitives. It supports stock and mutual-fund browsing, virtual
+  funding, immediate latest-loaded-price fills, holdings, FIFO realized trades,
+  watchlists, P&L, order history, and reset. Mutual funds require the generated AMFI
+  catalog and per-scheme NAV files; synthetic/uploaded modes remain stock-only.
+- Added `src/ml_portfolio/options.py`, a deterministic European Black-Scholes engine
+  for model premiums, delta/gamma/theta/vega, editable multi-leg templates, expiry
+  payoff and breakevens, bounded/unbounded risk, risk-neutral probability/expectation,
+  delta-hedge units, and spot/IV scenario P&L.
+- Added the Options Lab workspace with Straddle, Strangle, Iron Condor, Call Butterfly,
+  Batman, and Custom templates, editable legs, charts, scenario tables, and CSV export.
+  It is deliberately assumption-driven: no live option chain, margin, costs, liquidity,
+  early exercise, historical options backtest, or execution is represented.
+- Added `tests/options_checks.py` and an Options Lab UI smoke test covering pricing
+  parity, representative payoff shapes, zero-price short-put tail risk, scenario
+  anchoring, rendering, and template switching.

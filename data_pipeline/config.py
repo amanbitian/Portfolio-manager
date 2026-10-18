@@ -57,6 +57,7 @@ class PipelineConfig:
             "yfinance": RateLimit(rps=1.5),
             "assets": RateLimit(rps=2.0),
             "screener": RateLimit(rps=0.22),   # be gentle: ~1 request / 4.5s
+            "et_news": RateLimit(rps=8.0),     # full-text article pages from economictimes.indiatimes.com
         }
     )
     http_retries: int = 5

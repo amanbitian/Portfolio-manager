@@ -23,7 +23,8 @@ class WorkflowChecks(unittest.TestCase):
         # exercised from a fresh app so a recurrence is caught, not left to a
         # navigation sequence no test happens to follow.
         import itertools
-        pages = ["Portfolio", "Research", "Research Agent", "Strategy Copilot", "Saved Decisions"]
+        pages = ["Portfolio", "Paper Trading", "Options Lab", "Research", "Research Agent", "Strategy Copilot",
+                 "Saved Decisions"]
         for first, second in itertools.permutations(pages, 2):
             with self.subTest(hop=f"{first} -> {second}"):
                 app = AppTest.from_file(str(ROOT / "app.py"), default_timeout=60).run()
@@ -140,6 +141,17 @@ table_preview(frame, 'test_table')
         self.assertFalse(app.error)
         self.assertTrue(any(m.label == "CAGR" for m in app.metric))
         self.assertTrue(app.code)
+
+    def test_options_lab_renders_and_reprices_template(self):
+        app = AppTest.from_file(str(ROOT / "app.py"), default_timeout=60).run()
+        next(r for r in app.radio if r.label == "Workspace").set_value("Options Lab").run()
+        self.assertFalse(app.exception)
+        self.assertFalse(app.error)
+        self.assertTrue(any(m.label == "Model probability of profit" for m in app.metric))
+        self.assertTrue(any(t.label == "Strategy template" for t in app.selectbox))
+        next(t for t in app.selectbox if t.label == "Strategy template").set_value("Iron Condor").run()
+        self.assertFalse(app.exception)
+        self.assertTrue(any(m.label == "Net credit" for m in app.metric))
 
 
 if __name__ == "__main__":

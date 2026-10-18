@@ -37,6 +37,32 @@ def load_universe(data_root: Path) -> pd.DataFrame:
     return universe[universe["instrument_key"].notna()].sort_values("symbol").reset_index(drop=True)
 
 
+def load_mutual_fund_catalog(data_root: Path) -> pd.DataFrame:
+    """Pre-built browse/rank summary over ingested AMFI mutual fund NAV history:
+    one row per scheme with latest NAV, trailing 1y/3y returns, and the fund
+    house/category metadata (see data_pipeline.mutual_fund_catalog, which derives
+    this from the raw per-scheme NAV files - opening those ~38k files directly on
+    every page load would take minutes, not the sub-second response browsing
+    needs)."""
+    path = Path(data_root) / "reference" / "mutual_fund_catalog.parquet"
+    if not path.exists():
+        raise MarketDataError(
+            f"Mutual fund catalog not found at {path}. Run the data pipeline's "
+            "`mutual-funds` then `mutual-fund-catalog` steps first."
+        )
+    return pd.read_parquet(path)
+
+
+def load_mutual_fund_nav(data_root: Path, scheme_code: int | str) -> pd.Series:
+    """Full daily NAV history for one scheme, one small file - unlike the
+    catalog above, this is read on demand per scheme, not pre-aggregated."""
+    path = Path(data_root) / "fundamentals" / "mutual_funds" / "nav" / f"{int(scheme_code)}.parquet"
+    if not path.exists():
+        raise MarketDataError(f"No NAV history for scheme {scheme_code}.")
+    df = pd.read_parquet(path, columns=["date", "nav"])
+    return df.set_index("date")["nav"].sort_index()
+
+
 def dataset_fingerprint(data_root: Path, symbols: list[str], start=None, end=None) -> str:
     """A cheap cache key: no data content is read. Changes when the ingestion
     manifest is updated (new pipeline run) or the selection changes - unlike

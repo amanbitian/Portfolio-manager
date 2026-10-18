@@ -134,15 +134,30 @@ def write_artifact(root: Path, key: str, payload: dict) -> Path:
         return value
 
     temporary = root / f".{key}.tmp"
+    backup = folder.with_name(f".{folder.name}.{uuid4().hex}.bak")
+    replaced_existing = False
     try:
         encoded = encode(payload)
         temporary.write_text(json.dumps(encoded, allow_nan=False), encoding="utf-8")
+        # `os.replace` can't atomically overwrite an existing non-empty
+        # directory on Windows (raises "Access is denied") - only a problem
+        # for a caller that reuses the same `key` across saves (e.g. a
+        # single persistent account updated in place, unlike the
+        # timestamp+uuid keys every other caller in this codebase mints
+        # fresh each time). Move the old folder aside first so both
+        # `os.replace` calls below are plain renames onto non-existing
+        # paths, which is atomic on every platform.
+        if folder.exists():
+            os.replace(folder, backup)
+            replaced_existing = True
         os.replace(staging, folder)
         os.replace(temporary, root / f"{key}.json")
     finally:
         if staging.exists() and staging.resolve().is_relative_to(root.resolve()):
             shutil.rmtree(staging)
         temporary.unlink(missing_ok=True)
+        if replaced_existing and backup.exists():
+            shutil.rmtree(backup)
     return root / f"{key}.json"
 
 

@@ -346,6 +346,28 @@ def load_transaction_ledger(path: Path) -> dict:
     return payload
 
 
+PAPER_ACCOUNT_KEY = "paper_trading_account"
+
+
+def load_paper_account(root: Path) -> pd.DataFrame | None:
+    """Fixed-key artifact (not timestamped like `save_transaction_ledger`) so
+    the paper trading page always reads/writes the same single account."""
+    path = root / f"{PAPER_ACCOUNT_KEY}.json"
+    if not path.exists():
+        return None
+    payload = load_artifact(path)
+    if payload.get("kind") != "paper_trading_account":
+        raise ValueError("Unsupported paper trading account.")
+    return payload["transactions"]
+
+
+def save_paper_account(root: Path, transactions: pd.DataFrame) -> Path:
+    return write_artifact(root, PAPER_ACCOUNT_KEY, {"schema_version": SCHEMA_VERSION,
+                                                     "kind": "paper_trading_account",
+                                                     "saved_at": datetime.now(timezone.utc),
+                                                     "transactions": transactions})
+
+
 def transaction_ledgers(root: Path) -> dict[Path, str]:
     import json
     choices = {}

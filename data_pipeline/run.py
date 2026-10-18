@@ -7,6 +7,8 @@
     py -3 -m data_pipeline.run fundamentals
     py -3 -m data_pipeline.run macro
     py -3 -m data_pipeline.run news --limit 10
+    py -3 -m data_pipeline.run mutual-funds
+    py -3 -m data_pipeline.run mutual-fund-catalog
     py -3 -m data_pipeline.run status
     py -3 -m data_pipeline.run all
 """
@@ -139,6 +141,10 @@ def main(argv: list[str] | None = None) -> int:
                            "(mfapi always returns full history to today, so a 'done' scheme otherwise never "
                            "picks up newly published NAVs on a later run)")
 
+    p_mfc = sub.add_parser("mutual-fund-catalog",
+                          help="derive reference/mutual_fund_catalog.parquet from ingested NAV history")
+    p_mfc.add_argument("--workers", type=int, default=64, help="parallel read workers")
+
     p_cc = sub.add_parser("news-cc", help="historical news from Common Crawl (2017+)")
     p_cc.add_argument("--phase", choices=["catalog", "fetch", "both"], default="both")
     p_cc.add_argument("--since", type=int, default=2017,
@@ -148,6 +154,14 @@ def main(argv: list[str] | None = None) -> int:
     p_cc.add_argument("--domains", help="comma list: et,bs,mint,hbl,mc,fe,bt")
     p_cc.add_argument("--limit", type=int, help="max articles to fetch this run")
     p_cc.add_argument("--workers", type=int, default=6, help="parallel fetch workers")
+
+    p_ft = sub.add_parser("news-fulltext",
+                          help="full-text news from publisher sitemaps (one source-month at a time)")
+    p_ft.add_argument("--source", default="et", choices=["et"],
+                      help="publisher key (sitemaps available: et)")
+    p_ft.add_argument("--month", required=True, help="YYYY-MM")
+    p_ft.add_argument("--limit", type=int, help="max articles to fetch this run")
+    p_ft.add_argument("--workers", type=int, default=4, help="parallel fetch workers")
 
     sub.add_parser("status", help="manifest + disk summary")
     sub.add_parser("all", help="universe -> 1day -> corp-actions -> fundamentals -> macro -> news pilot")
@@ -231,6 +245,10 @@ def main(argv: list[str] | None = None) -> int:
         from .ingest import mutual_funds
 
         mutual_funds.run(cfg, limit=args.limit, workers=args.workers, refresh_after_days=args.refresh_after_days)
+    elif args.cmd == "mutual-fund-catalog":
+        from .mutual_fund_catalog import build_mutual_fund_catalog
+
+        build_mutual_fund_catalog(cfg, workers=args.workers)
     elif args.cmd == "news-cc":
         from .ingest import news_cc
 
@@ -244,6 +262,16 @@ def main(argv: list[str] | None = None) -> int:
             phase=args.phase,
             since=args.since,
             domains=domains,
+            limit=args.limit,
+            workers=args.workers,
+        )
+    elif args.cmd == "news-fulltext":
+        from .ingest import news_fulltext
+
+        news_fulltext.run(
+            cfg,
+            source=args.source,
+            month=args.month,
             limit=args.limit,
             workers=args.workers,
         )

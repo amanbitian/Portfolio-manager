@@ -6,6 +6,7 @@ from io import BytesIO
 import sys
 from dataclasses import replace
 from pathlib import Path
+from uuid import uuid4
 
 import numpy as np
 import pandas as pd
@@ -20,7 +21,8 @@ from ml_portfolio import AllocationConfig, BacktestConfig, load_price_csv, make_
 from ml_portfolio.data import validate_prices
 from ml_portfolio.decisions import MIN_LISTING_HISTORY_DAYS
 from ml_portfolio.market_data import (MarketDataError, dataset_fingerprint, load_market_prices,
-                                      load_universe, resolve_data_root)
+                                      load_mutual_fund_catalog, load_mutual_fund_nav, load_universe,
+                                      resolve_data_root)
 from ml_portfolio.optimizers import METHODS
 from ml_portfolio.portfolio import build_proposal, save_proposal, saved_proposals
 from ml_portfolio.reporting import (concentration, downsample_preserving_extrema, drawdown_series, metric_table,
@@ -30,10 +32,16 @@ from ml_portfolio.backtest import run_strategy_comparison
 from ml_portfolio.experiments import research_overview, save_research
 from ml_portfolio.holdings import (INSTRUMENT_TYPES, PURCHASE_COLUMNS, load_purchase_portfolio,
                                   purchase_portfolios, save_purchase_portfolio, value_purchases)
-from ml_portfolio.ledger import (TRANSACTION_ACTIONS, append_transactions, load_transaction_ledger,
-                                 save_transaction_ledger, transaction_ledgers, value_ledger)
+from ml_portfolio.ledger import (TRANSACTION_ACTIONS, append_transactions, load_paper_account,
+                                 load_transaction_ledger, save_paper_account, save_transaction_ledger,
+                                 transaction_ledgers, value_ledger)
 from ml_portfolio.research_agent import (build_price_research_report, load_research_report,
                                          research_reports, save_research_report)
+from ml_portfolio.research_registry import (VALID_STATUSES, list_experiments, set_research_meta,
+                                            summarize_experiments)
+from ml_portfolio.robustness import run_robustness_checks, save_robustness_report, verdict_conclusion
+from ml_portfolio.options import (OPTION_TYPES, SIDES, STRATEGIES, OptionAssumptions, scenario_matrix,
+                                  strategy_legs, strategy_summary)
 from ml_portfolio.strategy_copilot import (compile_strategy_prompt, load_strategy_run, load_strategy_sweep,
                                            run_strategy_dsl_backtest, save_strategy_run, save_strategy_sweep,
                                            strategy_from_controls, strategy_runs, strategy_sweeps, sweep_strategy)
@@ -73,6 +81,15 @@ def cached_saved_proposals(prices, latest_prices, as_of, dir_fingerprint):
     return saved_proposals(ROOT / "experiments", latest_prices, as_of, prices)
 
 
+@st.cache_data(show_spinner=False, max_entries=3)
+def cached_experiments(dir_fingerprint):
+    # Same fingerprint-gated pattern as cached_saved_proposals above: without
+    # it, every widget interaction on the Research Registry page (a filter
+    # multiselect, an unrelated form field) would re-glob experiments/ and
+    # re-parse every saved manifest's full JSON text on each Streamlit rerun.
+    return list_experiments(ROOT / "experiments")
+
+
 @st.cache_data(show_spinner=False)
 def demo_prices(periods, seed, end_date):
     return make_synthetic_prices(periods=periods, seed=seed, end_date=end_date)
@@ -84,6 +101,40 @@ def real_data_prices(data_root, symbols, start, end, fingerprint_key):
     # fresh pipeline run (which changes the manifest mtime) invalidates the cache
     # even when the symbol/date selection itself is unchanged.
     return load_market_prices(data_root, list(symbols), start or None, end or None)
+
+
+@st.cache_data(show_spinner="Loading the stock universe...", max_entries=2)
+def paper_universe_prices(data_root, symbols, start, end, fingerprint_key):
+    # A short recent window (~4 months, see caller) across every symbol in the
+    # universe, not the full history a backtest would need - this is what makes
+    # searching/browsing the whole 750-stock universe on the Paper Trading page
+    # cheap (~1s) instead of the ~15s a full-history load across that many
+    # symbols costs. `fingerprint_key` mirrors `real_data_prices`: unused
+    # inside, but keeps a fresh pipeline run from being served stale cache.
+    prices, _report = load_market_prices(data_root, list(symbols), start, end)
+    return prices
+
+
+def _mtime_fingerprint(path):
+    try:
+        return Path(path).stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+@st.cache_data(show_spinner="Loading the mutual fund universe...", max_entries=1)
+def paper_fund_catalog(data_root, fingerprint_key):
+    # `fingerprint_key` (the catalog file's own mtime) invalidates this cache
+    # whenever `data_pipeline.run mutual-fund-catalog` is rerun - same pattern
+    # as `real_data_prices`/`paper_universe_prices`, just keyed off a file
+    # mtime instead of the market-data manifest since this reference table has
+    # its own independent build step.
+    return load_mutual_fund_catalog(Path(data_root))
+
+
+@st.cache_data(show_spinner=False, max_entries=512)
+def paper_fund_nav(data_root, scheme_code):
+    return load_mutual_fund_nav(Path(data_root), scheme_code)
 
 
 def price_hash(prices):
@@ -150,6 +201,23 @@ def allocation_frame(proposal, limit=80):
         keep.append("CASH")
     other = frame.drop(index=keep, errors="ignore").sum().rename("Other")
     return pd.concat([frame.loc[keep], other.to_frame().T])
+
+
+def research_context_inputs(key_prefix, default_question="", default_hypothesis=""):
+    """A small optional 'research context' capture reused at every save
+    site: a question and hypothesis tagged onto the saved artifact via
+    research_registry.set_research_meta, so it shows up in the Research
+    Registry view. Left blank, nothing is tagged - existing save behavior
+    is unchanged."""
+    with st.expander("Tag with research context (optional)"):
+        question = st.text_input("Research question", value=default_question, key=f"{key_prefix}_question")
+        hypothesis = st.text_input("Hypothesis", value=default_hypothesis, key=f"{key_prefix}_hypothesis")
+    return question.strip(), hypothesis.strip()
+
+
+def tag_research_context(path, question, hypothesis, parent_id=None):
+    if question or hypothesis or parent_id:
+        set_research_meta(path, research_question=question, hypothesis=hypothesis, parent_id=parent_id)
 
 
 def table_preview(frame, key, page_size=100):
@@ -463,9 +531,11 @@ def portfolio_view(prices, config, train_days, cost_bps):
         st.dataframe(decision["checks"], width="stretch", hide_index=True)
         st.json(decision["solver"])
     show_validation(decision)
+    question, hypothesis = research_context_inputs("proposal")
     if st.button("Save decision", disabled=not proposal["accepted"] or st.session_state.get("saved_proposal") == signature):
         try:
             path = save_proposal(ROOT / "experiments", proposal, prices, config, train_days, cost_bps)
+            tag_research_context(path, question, hypothesis)
             st.session_state["saved_proposal"] = signature
             st.success(f"Saved decision {path.stem}")
         except (ValueError, OSError) as exc:
@@ -562,9 +632,11 @@ def research_view(prices, config, train_days, cost_bps):
             frame = primary[table]
             st.download_button("Download CSV", frame.to_csv(index=table in ("weights", "holdings")),
                                file_name=f"{table}.csv", mime="text/csv", on_click="ignore")
+    question, hypothesis = research_context_inputs("research")
     if st.button("Save research run", disabled=st.session_state.get("saved_research") == signature):
         try:
             path = save_research(ROOT / "experiments", prices, config, backtest, results)
+            tag_research_context(path, question, hypothesis)
             st.session_state["saved_research"] = signature
             st.success(f"Saved research {path.stem}")
         except (ValueError, OSError) as exc:
@@ -631,6 +703,7 @@ def research_agent_view(prices):
     if st.button("Save this report", disabled=st.session_state.get("saved_research_report") == signature):
         try:
             path = save_research_report(ROOT / "experiments", report_name, prices, report)
+            tag_research_context(path, question, report["hypothesis"]["title"])
             st.session_state["saved_research_report"] = signature
             st.session_state["saved_research_report_id"] = path.stem
             st.success(f"Saved research report {path.stem}")
@@ -643,6 +716,7 @@ def research_agent_view(prices):
             try:
                 path = save_research_report(ROOT / "experiments", report_name or f"{report['symbol']} research",
                                             prices, report)
+                tag_research_context(path, question, report["hypothesis"]["title"])
                 st.session_state["saved_research_report"] = signature
                 report_id = path.stem
                 st.session_state["saved_research_report_id"] = report_id
@@ -653,6 +727,141 @@ def research_agent_view(prices):
         st.session_state["copilot_source_report_id"] = report_id
         st.success("Hypothesis copied to Strategy Copilot."
                   + (f" Linked to saved report {report_id}." if report_id else ""))
+
+
+def _money(value):
+    if value is None:
+        return "Unlimited"
+    return f"₹{value:,.0f}"
+
+
+def options_lab_page():
+    """Interactive, quote-free multi-leg options strategy sandbox."""
+    st.title("Options Strategy Lab")
+    st.caption("Build and stress-test a multi-leg strategy with deterministic Black–Scholes analytics. "
+               "Prices are theoretical—not live quotes or an execution recommendation.")
+
+    st.sidebar.subheader("Options Lab assumptions")
+    underlying = st.sidebar.text_input("Underlying", value="NIFTY", key="options_underlying")
+    spot = st.sidebar.number_input("Spot price", min_value=1.0, value=25400.0, step=50.0,
+                                   key="options_spot")
+    days = st.sidebar.number_input("Days to expiry", min_value=0, max_value=1095, value=30, step=1,
+                                   key="options_days")
+    volatility_pct = st.sidebar.number_input("Implied volatility (%)", min_value=0.1, max_value=300.0,
+                                              value=18.0, step=0.5, key="options_iv")
+    rate_pct = st.sidebar.number_input("Risk-free rate (%)", min_value=-10.0, max_value=50.0,
+                                       value=6.0, step=0.25, key="options_rate")
+    dividend_pct = st.sidebar.number_input("Dividend yield (%)", min_value=0.0, max_value=25.0,
+                                           value=0.0, step=0.25, key="options_dividend")
+    lot_size = st.sidebar.number_input("Contract lot size", min_value=1, max_value=100000,
+                                       value=25, step=1, key="options_lot_size")
+    strategy_lots = st.sidebar.number_input("Strategy lots", min_value=1, max_value=1000,
+                                            value=1, step=1, key="options_strategy_lots")
+
+    top = st.columns([2, 1, 1])
+    strategy = top[0].selectbox("Strategy template", STRATEGIES, key="options_strategy")
+    spacing = top[1].number_input("Strike spacing", min_value=0.01, value=200.0, step=50.0,
+                                  key="options_spacing")
+    objective = top[2].selectbox("Objective", ["Income", "Volatility", "Delta neutral",
+                                                "Portfolio hedge", "Directional"],
+                                  key="options_objective")
+    st.caption(f"{underlying or 'Underlying'} · {days} days · {volatility_pct:.1f}% IV · "
+               f"{int(lot_size) * int(strategy_lots):,} underlying units per displayed strategy")
+
+    template = strategy_legs(strategy, float(spot), float(spacing))
+    editor_key = f"options_legs_{strategy}_{float(spot):.4f}_{float(spacing):.4f}"
+    st.subheader("Strategy legs")
+    st.caption("Start from the template, then add, remove, or edit legs. Premiums are recalculated from the assumptions.")
+    legs = st.data_editor(
+        template,
+        key=editor_key,
+        num_rows="dynamic",
+        hide_index=True,
+        width="stretch",
+        column_config={
+            "side": st.column_config.SelectboxColumn("Side", options=list(SIDES), required=True),
+            "option_type": st.column_config.SelectboxColumn("Type", options=list(OPTION_TYPES), required=True),
+            "strike": st.column_config.NumberColumn("Strike", min_value=0.01, format="%.2f", required=True),
+            "quantity": st.column_config.NumberColumn("Contracts", min_value=1, step=1, required=True),
+        },
+    )
+    assumptions = OptionAssumptions(float(spot), int(days), float(volatility_pct) / 100.0,
+                                    float(rate_pct) / 100.0, float(dividend_pct) / 100.0,
+                                    int(lot_size), int(strategy_lots))
+    try:
+        summary = strategy_summary(legs, assumptions)
+    except (ValueError, ArithmeticError) as exc:
+        st.error(str(exc))
+        return
+
+    priced = summary["priced_legs"].copy()
+    priced["entry_cash_flow"] = -priced.position_value
+    order_table = priced.rename(columns={"side": "Side", "option_type": "Type", "strike": "Strike",
+                                                 "quantity": "Contracts", "model_price": "Model premium",
+                                                 "entry_cash_flow": "Entry cash flow", "delta": "Delta",
+                                                 "gamma": "Gamma", "theta_per_day": "Theta / day",
+                                                 "vega_per_point": "Vega / vol pt"})
+    order_table = order_table[["Side", "Type", "Strike", "Contracts", "Model premium",
+                               "Entry cash flow", "Delta", "Gamma", "Theta / day", "Vega / vol pt"]]
+
+    premium_label = "Net credit" if summary["net_premium"] >= 0 else "Net debit"
+    premium_value = abs(float(summary["net_premium"]))
+    max_loss = summary["max_loss"]
+    metrics = st.columns(5)
+    metrics[0].metric(premium_label, _money(premium_value))
+    metrics[1].metric("Max profit", _money(summary["max_profit"]))
+    metrics[2].metric("Max loss", "Unlimited" if max_loss is None else _money(abs(float(max_loss))))
+    breakeven_text = ", ".join(f"{value:,.0f}" for value in summary["breakevens"]) or "None"
+    metrics[3].metric("Breakeven(s)", breakeven_text)
+    metrics[4].metric("Model probability of profit", f"{summary['probability_profit']:.1%}")
+
+    payoff_tab, greeks_tab, scenarios_tab, orders_tab = st.tabs(
+        ["Payoff", "Greeks & hedge", "Scenario P&L", "Order detail"])
+    with payoff_tab:
+        payoff = summary["payoff"].set_index("terminal_spot").rename(columns={"pnl": "Expiry P&L"})
+        st.line_chart(payoff, x_label="Underlying at expiry", y_label="Profit / loss (₹)")
+        payoff_cols = st.columns(3)
+        payoff_cols[0].metric("Risk-neutral expected P&L", _money(float(summary["expected_pnl"])))
+        if max_loss is not None and float(max_loss) < 0 and summary["max_profit"] is not None:
+            return_on_risk = float(summary["max_profit"]) / abs(float(max_loss))
+            payoff_cols[1].metric("Max return on risk", f"{return_on_risk:.1%}")
+        else:
+            payoff_cols[1].metric("Max return on risk", "N/A")
+        payoff_cols[2].metric("Objective", objective)
+        st.caption("Probability and expected P&L use the risk-neutral lognormal distribution implied by the inputs; "
+                   "they are model estimates, not historical win rates.")
+    with greeks_tab:
+        greek_cols = st.columns(4)
+        greek_cols[0].metric("Delta", f"{summary['delta']:+,.2f}")
+        greek_cols[1].metric("Gamma", f"{summary['gamma']:+,.4f}")
+        greek_cols[2].metric("Theta / day", _money(float(summary["theta_per_day"])))
+        greek_cols[3].metric("Vega / vol point", _money(float(summary["vega_per_point"])))
+        hedge_units = -float(summary["delta"])
+        st.subheader("Delta-neutral hedge")
+        if abs(hedge_units) < 0.5:
+            st.success("The position is approximately delta neutral at the current inputs (under 0.5 unit).")
+        else:
+            action = "Buy" if hedge_units > 0 else "Sell"
+            st.info(f"{action} approximately **{abs(hedge_units):,.1f} {underlying or 'underlying'} units** "
+                    "to offset the current model delta. Recalculate after spot, time, or IV changes.")
+        st.caption("This is a point-in-time sensitivity hedge. Gamma means delta will move as the underlying moves.")
+    with scenarios_tab:
+        remaining = st.slider("Days remaining in scenario", min_value=0, max_value=max(int(days), 1),
+                              value=max(int(days) // 2, 0), key="options_scenario_days")
+        scenarios = scenario_matrix(legs, assumptions, days_remaining=int(remaining))
+        st.dataframe(scenarios.style.format("₹{:,.0f}"), width="stretch")
+        st.caption("Mark-to-model P&L versus entry premium. IV shocks are absolute changes; IV +5% means, for "
+                   "example, 18% to 23%.")
+    with orders_tab:
+        st.dataframe(order_table.style.format({"Strike": "{:,.2f}", "Model premium": "₹{:,.2f}",
+                                               "Entry cash flow": "₹{:,.0f}", "Delta": "{:+,.2f}",
+                                               "Gamma": "{:+,.4f}", "Theta / day": "₹{:+,.2f}",
+                                               "Vega / vol pt": "₹{:+,.2f}"}),
+                     width="stretch", hide_index=True)
+        st.download_button("Download strategy legs", order_table.to_csv(index=False),
+                           file_name="options_strategy_legs.csv", mime="text/csv")
+        st.warning("Paper analytics only. The lab does not include bid/ask spreads, slippage, taxes, margin, "
+                   "liquidity, early exercise, assignment, or multi-leg execution risk.")
 
 
 def _parse_candidates(text: str) -> list[int]:
@@ -729,9 +938,12 @@ def strategy_sweep_view(prices):
         col.metric(name, metric(ft_metrics[name], name != "Sharpe"))
     st.line_chart(sweep["final_test_result"]["equity_curve"][["equity", "gross_equity"]])
     sweep_name = st.text_input("Sweep name", value=f"{template} sweep", key="sweep_name")
+    question, hypothesis = research_context_inputs(
+        "sweep", default_hypothesis=f"{template} over {list(sweep['param_grid'])} improves risk-adjusted returns.")
     if st.button("Save this sweep", disabled=st.session_state.get("saved_strategy_sweep") == signature):
         try:
             path = save_strategy_sweep(ROOT / "experiments", sweep_name, prices, sweep)
+            tag_research_context(path, question, hypothesis)
             st.session_state["saved_strategy_sweep"] = signature
             st.success(f"Saved sweep {path.stem}")
         except (ValueError, OSError) as exc:
@@ -835,20 +1047,755 @@ def strategy_copilot_view(prices, cost_bps, config):
     with score_tab:
         table_preview(result["latest_scores"], "copilot_scores")
     run_name = st.text_input("Run name", value="My strategy run", key="strategy_run_name")
+    question, hypothesis = research_context_inputs("strategy_run", default_hypothesis=prompt)
     if st.button("Save this run", disabled=st.session_state.get("saved_strategy_run") == signature):
         try:
+            source_report_id = st.session_state.get("copilot_source_report_id")
             path = save_strategy_run(ROOT / "experiments", run_name, prices, result,
-                                     source_research_report_id=st.session_state.get("copilot_source_report_id"))
+                                     source_research_report_id=source_report_id)
+            tag_research_context(path, question, hypothesis, parent_id=source_report_id)
             st.session_state["saved_strategy_run"] = signature
             st.success(f"Saved strategy run {path.stem}")
         except (ValueError, OSError) as exc:
             st.error(f"Could not save strategy run: {exc}")
 
 
+_PAPER_ACCOUNT_ROOT = ROOT / "experiments"
+
+_PAPER_TRADING_CSS = """
+<style>
+[data-testid="stAppViewContainer"] > .main { background-color: #F6F8FA; }
+[data-testid="stSidebar"] { background-color: #FFFFFF; }
+[data-testid="stMetric"] {
+    background: #FFFFFF; border: 1px solid #EDF0F3; border-radius: 16px;
+    padding: 16px 18px 12px 18px; box-shadow: 0 1px 2px rgba(16,24,40,.04);
+}
+[data-testid="stMetricLabel"] { color: #6B7280; font-size: .76rem; text-transform: uppercase; letter-spacing: .04em; }
+[data-testid="stMetricValue"] {
+    color: #12151A; font-weight: 700; font-size: 1.45rem;
+    white-space: normal; overflow: visible; text-overflow: clip; line-height: 1.25;
+}
+button[kind="primary"] { background-color: #00B386 !important; border-color: #00B386 !important; }
+button[kind="primary"]:hover { background-color: #00966F !important; border-color: #00966F !important; }
+.gw-row { display: flex; align-items: center; padding: 10px 4px; border-bottom: 1px solid #EEF1F4; }
+.gw-symbol { font-weight: 700; color: #12151A; }
+.gw-sub { color: #8A94A6; font-size: .78rem; }
+.gw-th { color: #8A94A6; font-size: .72rem; text-transform: uppercase; letter-spacing: .04em; }
+.gw-pill-up { background: #E6F9F1; color: #00966F; padding: 2px 9px; border-radius: 999px; font-weight: 600; font-size: .82rem; white-space: nowrap; }
+.gw-pill-down { background: #FDEAE6; color: #D8492F; padding: 2px 9px; border-radius: 999px; font-weight: 600; font-size: .82rem; white-space: nowrap; }
+.gw-ltp { font-size: 1.5rem; font-weight: 700; color: #12151A; margin-bottom: 6px; }
+.gw-card { background: #FFFFFF; border: 1px solid #EDF0F3; border-radius: 16px; padding: 18px 20px; box-shadow: 0 1px 2px rgba(16,24,40,.04); }
+.gw-brand { display: flex; align-items: baseline; gap: 10px; margin-bottom: 2px; }
+.gw-brand-mark { font-size: 1.9rem; font-weight: 800; color: #12151A; }
+.gw-brand-badge { background: #00B386; color: #FFFFFF; font-size: .7rem; font-weight: 700; padding: 3px 9px;
+    border-radius: 999px; text-transform: uppercase; letter-spacing: .04em; }
+.gw-brand-sub { color: #6B7280; font-size: .88rem; margin-bottom: 18px; }
+[data-testid="stTabs"] [data-baseweb="tab-list"] {
+    background: #EEF1F4; border-radius: 12px; padding: 4px; gap: 2px;
+}
+[data-testid="stTabs"] [data-baseweb="tab"] {
+    border-radius: 9px; padding: 6px 16px; color: #6B7280; font-weight: 600;
+}
+[data-testid="stTabs"] [aria-selected="true"] {
+    background: #FFFFFF; color: #12151A; box-shadow: 0 1px 2px rgba(16,24,40,.08);
+}
+[data-testid="stTabs"] [data-baseweb="tab-highlight"], [data-testid="stTabs"] [data-baseweb="tab-border"] {
+    display: none;
+}
+.gw-searchbar input { border-radius: 12px !important; background: #FFFFFF; }
+</style>
+"""
+
+
+def _pill(value, text):
+    css = "gw-pill-up" if value >= 0 else "gw-pill-down"
+    return f'<span class="{css}">{text}</span>'
+
+
+def _paper_ledger():
+    if "paper_ledger" not in st.session_state:
+        try:
+            st.session_state["paper_ledger"] = load_paper_account(_PAPER_ACCOUNT_ROOT)
+        except (ValueError, KeyError, OSError) as exc:
+            st.error(f"Could not load paper trading account: {exc}")
+            st.session_state["paper_ledger"] = None
+    return st.session_state["paper_ledger"]
+
+
+def _persist_paper_ledger(transactions):
+    save_paper_account(_PAPER_ACCOUNT_ROOT, transactions)
+    st.session_state["paper_ledger"] = transactions
+
+
+def _paper_transaction(action, as_of, symbol=None, instrument_type=None, quantity=None, price=None,
+                       amount=None, notes=""):
+    # A random nonce in `notes` keeps two identical same-day orders (same
+    # symbol/qty/price) from hashing to the same transaction_id and being
+    # silently dropped as a duplicate by `append_transactions`'s CSV-reimport
+    # dedup logic - each paper order is its own event even if it repeats.
+    return pd.DataFrame([{"action": action, "symbol": symbol, "instrument_type": instrument_type,
+                          "date": as_of, "quantity": quantity, "price": price, "amount": amount,
+                          "notes": f"{notes} #{uuid4().hex[:8]}".strip()}])
+
+
+def _held_fund_symbols(transactions):
+    if transactions is None or transactions.empty:
+        return []
+    return list(transactions.loc[transactions.instrument_type == "Mutual fund", "symbol"].dropna().unique())
+
+
+def _paper_fund_quote(data_root, symbol):
+    """(latest, previous) NAV for one scheme, or (None, None) if unavailable -
+    a held/watchlisted fund that later drops out of the curated catalog (see
+    `_curated_fund_catalog`) must still price without raising."""
+    if data_root is None:
+        return None, None
+    try:
+        nav = paper_fund_nav(str(data_root), symbol)
+    except MarketDataError:
+        return None, None
+    if nav.empty:
+        return None, None
+    latest = float(nav.iloc[-1])
+    prev = float(nav.iloc[-2]) if len(nav) > 1 else latest
+    return latest, prev
+
+
+def _paper_quote(symbol, prices, data_root):
+    """(latest, previous) price for any held/watchlisted/tradable symbol,
+    stock or mutual fund - the one place that knows how to resolve either,
+    so holdings/watchlist/order-ticket rendering doesn't need to care which
+    kind of instrument a symbol is."""
+    if symbol in prices.columns:
+        series = prices[symbol]
+        latest = float(series.iloc[-1])
+        prev = float(series.iloc[-2]) if len(series) > 1 else latest
+        return latest, prev
+    latest, prev = _paper_fund_quote(data_root, symbol)
+    if latest is None:
+        raise KeyError(symbol)
+    return latest, prev
+
+
+def _paper_valuation_prices(transactions, prices, data_root):
+    """`prices.iloc[-1]` extended with the latest NAV of every mutual fund
+    ever transacted - what `value_ledger` needs as its `latest_prices` arg to
+    price a ledger that mixes stocks and funds."""
+    base = prices.iloc[-1]
+    values = {}
+    for symbol in _held_fund_symbols(transactions):
+        latest, _prev = _paper_fund_quote(data_root, symbol)
+        if latest is not None:
+            values[symbol] = latest
+    return pd.concat([base, pd.Series(values, dtype=float)]) if values else base
+
+
+def _paper_prev_prices(transactions, prices, data_root):
+    base = prices.iloc[-2] if len(prices) > 1 else prices.iloc[-1]
+    values = {}
+    for symbol in _held_fund_symbols(transactions):
+        _latest, prev = _paper_fund_quote(data_root, symbol)
+        if prev is not None:
+            values[symbol] = prev
+    return pd.concat([base, pd.Series(values, dtype=float)]) if values else base
+
+
+def _place_paper_order(prices, symbol, side, quantity, instrument_type, data_root=None):
+    as_of = prices.index[-1]
+    if instrument_type == "Mutual fund":
+        price, _prev = _paper_fund_quote(data_root, symbol)
+        if price is None:
+            raise ValueError(f"No NAV available for scheme {symbol}.")
+    else:
+        price = float(prices[symbol].iloc[-1])
+    row = _paper_transaction(side, as_of, symbol=symbol, instrument_type=instrument_type,
+                             quantity=float(quantity), price=price, notes="Paper trade")
+    combined, _duplicates = append_transactions(st.session_state.get("paper_ledger"), row, as_of)
+    latest_all = _paper_valuation_prices(combined, prices, data_root)
+    value_ledger(combined, latest_all, as_of)  # raises if a sell exceeds holdings, before persisting
+    _persist_paper_ledger(combined)
+
+
+def _symbol_name(symbol_meta, symbol):
+    if symbol_meta is None or symbol not in symbol_meta.index:
+        return None
+    name = symbol_meta.loc[symbol, "name"]
+    return name if isinstance(name, str) and name and name != symbol else None
+
+
+def _render_paper_order_ticket(prices, book, symbol_meta=None, data_root=None, fund_catalog=None):
+    st.markdown('<div class="gw-card">', unsafe_allow_html=True)
+    st.subheader("Trade")
+    st.session_state.setdefault("paper_order_instrument", "Stock")
+    instrument = st.radio("Instrument", ["Stock", "Mutual fund"], horizontal=True,
+                          key="paper_order_instrument", disabled=fund_catalog is None)
+    if instrument == "Mutual fund" and fund_catalog is not None:
+        symbols = list(fund_catalog.index)
+        if st.session_state.get("paper_order_symbol") not in symbols:
+            st.session_state["paper_order_symbol"] = symbols[0]
+        symbol = st.selectbox("Scheme", symbols, key="paper_order_symbol",
+                              format_func=lambda s: _symbol_name(symbol_meta, s) or s)
+        try:
+            nav_series = paper_fund_nav(str(data_root), symbol)
+        except MarketDataError:
+            nav_series = pd.Series(dtype=float)
+        ltp = float(nav_series.iloc[-1]) if not nav_series.empty else None
+        prev = float(nav_series.iloc[-2]) if len(nav_series) > 1 else ltp
+        chart_series = nav_series.tail(180)
+    else:
+        instrument = "Stock"
+        symbols = list(prices.columns)
+        if st.session_state.get("paper_order_symbol") not in symbols:
+            st.session_state["paper_order_symbol"] = symbols[0]
+        symbol = st.selectbox("Symbol", symbols, key="paper_order_symbol",
+                              format_func=lambda s: f"{s} - {_symbol_name(symbol_meta, s)}"
+                              if _symbol_name(symbol_meta, s) else s)
+        ltp = float(prices[symbol].iloc[-1])
+        prev = float(prices[symbol].iloc[-2]) if len(prices) > 1 else ltp
+        chart_series = prices[symbol].tail(90)
+    change = (ltp / prev - 1) if prev else 0.0
+    st.markdown(f'<div class="gw-ltp">{metric(ltp)} {_pill(change, f"{change:+.2%}")}</div>',
+               unsafe_allow_html=True)
+    if len(chart_series) > 2:
+        st.line_chart(chart_series, height=140)
+    side = st.radio("Side", ["Buy", "Sell"], horizontal=True, key="paper_order_side")
+    held_qty = float(book["positions"].quantity.get(symbol, 0.0)) if not book["positions"].empty else 0.0
+    if instrument == "Mutual fund":
+        if side == "Sell":
+            st.caption(f"You hold {held_qty:,.4f} units")
+            quantity = st.number_input("Units to redeem", min_value=0.0, step=0.01, format="%.6f",
+                                       value=min(held_qty, 1.0) if held_qty else 0.0, key="paper_order_fund_units")
+            order_value = quantity * ltp if ltp else 0.0
+        else:
+            amount = st.number_input("Amount to invest", min_value=100.0, step=500.0, value=5000.0,
+                                     key="paper_order_amount")
+            quantity = amount / ltp if ltp else 0.0
+            order_value = amount
+            st.caption(f"= {quantity:,.4f} units at {metric(ltp)} NAV")
+    else:
+        if side == "Sell":
+            st.caption(f"You hold {held_qty:,.0f} shares")
+        quantity = st.number_input("Quantity", min_value=1, step=1, value=1, key="paper_order_qty")
+        order_value = quantity * ltp if ltp else 0.0
+    st.caption(f"Order value: {metric(order_value)} | Cash available: {metric(book['cash_balance'])}")
+    full_name = _symbol_name(symbol_meta, symbol) or symbol if instrument == "Mutual fund" else symbol
+    label = full_name if len(full_name) <= 28 else full_name[:27].rstrip() + "…"
+    if st.button(f"{side} {label}", type="primary", width="stretch", disabled=not quantity or not ltp):
+        try:
+            _place_paper_order(prices, symbol, side.lower(), quantity, instrument, data_root)
+            st.success(f"{side} order filled: {quantity:,.4f} {label} @ {ltp:,.2f}")
+            st.rerun()
+        except (ValueError, OSError) as exc:
+            st.error(str(exc))
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
+def _render_paper_holdings(book, prices, symbol_meta=None, data_root=None):
+    positions = book["positions"]
+    if positions.empty:
+        st.info("No holdings yet. Search a stock or mutual fund in Explore and place your first paper order.")
+        return
+    frame = positions.sort_values("current_value", ascending=False)
+    header = st.columns([2, 1, 1, 1, 1, 1.4])
+    for col, label in zip(header, ["Symbol", "Qty", "Avg. cost", "LTP", "Value", "P&L"]):
+        col.markdown(f'<span class="gw-th">{label}</span>', unsafe_allow_html=True)
+    for symbol, row in frame.iterrows():
+        try:
+            _latest, prior = _paper_quote(symbol, prices, data_root)
+        except KeyError:
+            prior = row.latest_price
+        change = (row.latest_price / prior - 1) if prior else 0.0
+        cols = st.columns([2, 1, 1, 1, 1, 1.4])
+        name = _symbol_name(symbol_meta, symbol)
+        sub = f'<span class="gw-sub">{name}</span><br>' if name else ""
+        cols[0].markdown(f'<span class="gw-symbol">{symbol}</span><br>{sub}'
+                         f'<span class="gw-sub">{_pill(change, f"{change:+.2%} today")}</span>',
+                         unsafe_allow_html=True)
+        qty_format = "{:,.0f}" if row.instrument_type == "Stock" else "{:,.4f}"
+        cols[1].write(qty_format.format(row.quantity))
+        cols[2].write(f"{row.average_purchase_price:,.2f}")
+        cols[3].write(f"{row.latest_price:,.2f}")
+        cols[4].write(f"{row.current_value:,.2f}")
+        pnl_pct = row.unrealized_gain / row.invested_cost if row.invested_cost else 0.0
+        cols[5].markdown(_pill(row.unrealized_gain, f"{row.unrealized_gain:+,.2f} ({pnl_pct:+.1%})"),
+                         unsafe_allow_html=True)
+
+
+_POPULAR_DEFAULT_WATCHLIST = ["RELIANCE", "HDFCBANK", "INFY", "TCS", "ICICIBANK", "ITC", "SBIN", "LT"]
+
+
+def _set_paper_order(symbol, side, instrument):
+    st.session_state["paper_order_symbol"] = symbol
+    st.session_state["paper_order_side"] = side
+    st.session_state["paper_order_instrument"] = instrument
+    st.rerun()
+
+
+def _render_paper_watchlist(prices, symbol_meta=None, data_root=None, fund_catalog=None):
+    popular = [s for s in _POPULAR_DEFAULT_WATCHLIST if s in prices.columns]
+    default = popular or list(prices.columns[: min(8, prices.shape[1])])
+    options = list(prices.columns) + (list(fund_catalog.index) if fund_catalog is not None else [])
+    watch = st.multiselect("Watchlist", options,
+                           default=st.session_state.get("paper_watchlist", default), key="paper_watchlist",
+                           format_func=lambda s: f"{s} - {_symbol_name(symbol_meta, s)}"
+                           if _symbol_name(symbol_meta, s) else s)
+    if not watch:
+        st.info("Add symbols to your watchlist, or star them from Explore.")
+        return
+    header = st.columns([2.4, 1, 1, 0.8, 0.8])
+    for col, label in zip(header, ["Symbol", "LTP", "Change", "", ""]):
+        col.markdown(f'<span class="gw-th">{label}</span>', unsafe_allow_html=True)
+    for symbol in watch:
+        is_fund = symbol not in prices.columns
+        try:
+            ltp, prior = _paper_quote(symbol, prices, data_root)
+        except KeyError:
+            continue
+        change = (ltp / prior - 1) if prior else 0.0
+        cols = st.columns([2.4, 1, 1, 0.8, 0.8])
+        name = _symbol_name(symbol_meta, symbol)
+        sub = f'<br><span class="gw-sub">{name}</span>' if name else ""
+        cols[0].markdown(f'<span class="gw-symbol">{symbol}</span>{sub}', unsafe_allow_html=True)
+        cols[1].write(f"{ltp:,.2f}")
+        cols[2].markdown(_pill(change, f"{change:+.2%}"), unsafe_allow_html=True)
+        instrument = "Mutual fund" if is_fund else "Stock"
+        if cols[3].button("Buy", key=f"paper_buy_{symbol}", width="stretch"):
+            _set_paper_order(symbol, "Buy", instrument)
+        if cols[4].button("Sell", key=f"paper_sell_{symbol}", width="stretch"):
+            _set_paper_order(symbol, "Sell", instrument)
+
+
+def _paper_stock_catalog(prices, symbol_meta):
+    symbols = list(prices.columns)
+    if symbol_meta is not None:
+        catalog = symbol_meta.reindex(symbols).reset_index().rename(columns={"index": "symbol"})
+    else:
+        catalog = pd.DataFrame({"symbol": symbols})
+    if "name" not in catalog.columns:
+        catalog["name"] = ""
+    if "industry" not in catalog.columns:
+        catalog["industry"] = ""
+    catalog["name"] = catalog["name"].fillna("")
+    catalog["industry"] = catalog["industry"].fillna("")
+    # Trailing return over the whole loaded window (~4 months for the real
+    # data lake) - what powers the "top performing stocks" default sort, the
+    # same role `return_1y` plays for the mutual fund catalog.
+    first, last = prices.iloc[0], prices.iloc[-1]
+    catalog["window_return"] = catalog["symbol"].map((last / first - 1).to_dict())
+    return catalog.set_index("symbol", drop=False)
+
+
+def _render_paper_explore(prices, symbol_meta=None):
+    st.markdown('<div class="gw-searchbar">', unsafe_allow_html=True)
+    query = st.text_input("Search", placeholder="Search stocks by symbol, company, or sector",
+                          key="paper_explore_query", label_visibility="collapsed")
+    st.markdown('</div>', unsafe_allow_html=True)
+    catalog = _paper_stock_catalog(prices, symbol_meta)
+    total = len(catalog)
+    if query:
+        needle = query.strip().upper()
+        mask = (catalog["symbol"].str.upper().str.contains(needle, regex=False) |
+               catalog["name"].str.upper().str.contains(needle, regex=False) |
+               catalog["industry"].str.upper().str.contains(needle, regex=False))
+        catalog = catalog[mask]
+    catalog = catalog.sort_values("window_return", ascending=False)
+    span_days = (prices.index[-1] - prices.index[0]).days
+    st.caption(f'{len(catalog):,} of {total:,} stocks' + (f' matching "{query}"' if query else
+              f", ranked by return over the last {span_days} days"))
+    if catalog.empty:
+        return
+    page_size = 20
+    pages = max(1, (len(catalog) + page_size - 1) // page_size)
+    page_key = "paper_explore_page"
+    if st.session_state.get(page_key, 1) > pages:
+        st.session_state[page_key] = 1
+    page_num = st.number_input("Page", min_value=1, max_value=pages, value=1, step=1,
+                               key=page_key) if pages > 1 else 1
+    start_i = (page_num - 1) * page_size
+    page_rows = catalog.iloc[start_i:start_i + page_size]
+    prev = prices.iloc[-2] if len(prices) > 1 else prices.iloc[-1]
+    watchlist = set(st.session_state.get("paper_watchlist", []))
+    header = st.columns([2.6, 1, 1, 0.9, 0.7, 0.9, 0.9])
+    for col, label in zip(header, ["Stock", "LTP", "Change", "Period return", "", "", ""]):
+        col.markdown(f'<span class="gw-th">{label}</span>', unsafe_allow_html=True)
+    for _, row in page_rows.iterrows():
+        symbol = row["symbol"]
+        ltp = float(prices[symbol].iloc[-1])
+        prior = float(prev.get(symbol, ltp))
+        change = (ltp / prior - 1) if prior else 0.0
+        cols = st.columns([2.6, 1, 1, 0.9, 0.7, 0.9, 0.9])
+        sub = f'<br><span class="gw-sub">{row["name"]}</span>' if row.get("name") else ""
+        cols[0].markdown(f'<span class="gw-symbol">{symbol}</span>{sub}', unsafe_allow_html=True)
+        cols[1].write(f"{ltp:,.2f}")
+        cols[2].markdown(_pill(change, f"{change:+.2%}"), unsafe_allow_html=True)
+        window_return = row["window_return"]
+        cols[3].markdown(_pill(window_return, f"{window_return:+.1%}") if pd.notna(window_return) else "—",
+                         unsafe_allow_html=True)
+        starred = symbol in watchlist
+        if cols[4].button("★" if starred else "☆", key=f"paper_star_{symbol}", width="stretch"):
+            updated = watchlist - {symbol} if starred else watchlist | {symbol}
+            st.session_state["paper_watchlist"] = sorted(updated)
+            st.rerun()
+        if cols[5].button("Buy", key=f"paper_explore_buy_{symbol}", width="stretch"):
+            _set_paper_order(symbol, "Buy", "Stock")
+        if cols[6].button("Sell", key=f"paper_explore_sell_{symbol}", width="stretch"):
+            _set_paper_order(symbol, "Sell", "Stock")
+
+
+_PLAUSIBLE_RETURN_BAND = (-0.75, 3.0)  # excludes scheme-code reuse/merger artifacts in raw AMFI history
+
+
+def _curated_fund_catalog(catalog):
+    """Direct Plan - Growth options with NAV updated recently - the standard,
+    lowest-cost variant most retail platforms lead with, out of the ~38k raw
+    scheme/plan combinations (many near-duplicates: Regular vs Direct, Growth
+    vs IDCW, plus long-dead schemes whose NAV stopped updating years ago)."""
+    fresh_cutoff = catalog["latest_date"].max() - pd.Timedelta(days=45)
+    fresh = catalog[catalog["latest_date"] >= fresh_cutoff]
+    name = fresh["scheme_name"]
+    direct_growth = fresh[name.str.contains("direct", case=False, na=False) &
+                          name.str.contains("growth", case=False, na=False)]
+    direct_growth = direct_growth.copy()
+    low, high = _PLAUSIBLE_RETURN_BAND
+    plausible = direct_growth["return_1y"].between(low, high)
+    direct_growth["return_1y"] = direct_growth["return_1y"].where(plausible)
+    direct_growth["symbol"] = direct_growth["scheme_code"].astype(str)
+    direct_growth = direct_growth.rename(columns={"scheme_name": "name", "scheme_category": "category"})
+    return direct_growth.set_index("symbol", drop=False)
+
+
+def _render_paper_funds_explore(fund_catalog):
+    st.markdown('<div class="gw-searchbar">', unsafe_allow_html=True)
+    query = st.text_input("Search", placeholder="Search mutual funds by name, AMC, or category",
+                          key="paper_fund_query", label_visibility="collapsed")
+    st.markdown('</div>', unsafe_allow_html=True)
+    total = len(fund_catalog)
+    catalog = fund_catalog
+    if query:
+        needle = query.strip().upper()
+        mask = (catalog["name"].str.upper().str.contains(needle, regex=False) |
+               catalog["fund_house"].str.upper().str.contains(needle, regex=False) |
+               catalog["category"].str.upper().str.contains(needle, regex=False))
+        catalog = catalog[mask]
+    ranked = catalog.sort_values("return_1y", ascending=False, na_position="last")
+    st.caption((f'{len(catalog):,} of {total:,} funds matching "{query}"' if query else
+               f"Top performing of {total:,} funds by 1-year return") +
+              " - Direct Plan, Growth option, NAV updated in the last 45 days.")
+    if ranked.empty:
+        return
+    page_size = 20
+    pages = max(1, (len(ranked) + page_size - 1) // page_size)
+    page_key = "paper_fund_page"
+    if st.session_state.get(page_key, 1) > pages:
+        st.session_state[page_key] = 1
+    page_num = st.number_input("Page", min_value=1, max_value=pages, value=1, step=1,
+                               key=page_key) if pages > 1 else 1
+    start_i = (page_num - 1) * page_size
+    page_rows = ranked.iloc[start_i:start_i + page_size]
+    watchlist = set(st.session_state.get("paper_watchlist", []))
+    header = st.columns([3.2, 1, 1, 0.7, 0.9, 0.9])
+    for col, label in zip(header, ["Fund", "NAV", "1Y return", "", "", ""]):
+        col.markdown(f'<span class="gw-th">{label}</span>', unsafe_allow_html=True)
+    for symbol, row in page_rows.iterrows():
+        cols = st.columns([3.2, 1, 1, 0.7, 0.9, 0.9])
+        sub = f'<br><span class="gw-sub">{row["fund_house"]} - {row["category"]}</span>'
+        cols[0].markdown(f'<span class="gw-symbol">{row["name"]}</span>{sub}', unsafe_allow_html=True)
+        cols[1].write(f"{row['latest_nav']:,.2f}")
+        ret = row["return_1y"]
+        cols[2].markdown(_pill(ret, f"{ret:+.1%}") if pd.notna(ret) else "—", unsafe_allow_html=True)
+        starred = symbol in watchlist
+        if cols[3].button("★" if starred else "☆", key=f"paper_fund_star_{symbol}", width="stretch"):
+            updated = watchlist - {symbol} if starred else watchlist | {symbol}
+            st.session_state["paper_watchlist"] = sorted(updated)
+            st.rerun()
+        if cols[4].button("Buy", key=f"paper_fund_buy_{symbol}", width="stretch"):
+            _set_paper_order(symbol, "Buy", "Mutual fund")
+        if cols[5].button("Sell", key=f"paper_fund_sell_{symbol}", width="stretch"):
+            _set_paper_order(symbol, "Sell", "Mutual fund")
+
+
+def _render_paper_orders(transactions, book):
+    view = transactions.sort_values("date", ascending=False)[
+        ["date", "action", "symbol", "quantity", "price", "amount", "notes"]]
+    table_preview(view, "paper_orders")
+    if not book["realized"].empty:
+        st.caption("Realized trades (closed positions, FIFO)")
+        table_preview(book["realized"], "paper_realized")
+
+
+def paper_trading_view(prices, symbol_meta=None, data_root=None, fund_catalog=None):
+    st.markdown(_PAPER_TRADING_CSS, unsafe_allow_html=True)
+    st.markdown('<div class="gw-brand"><span class="gw-brand-mark">Paper Trading</span>'
+               '<span class="gw-brand-badge">Practice</span></div>'
+               '<div class="gw-brand-sub">Trade with virtual cash at live-loaded prices. No real money, no real orders.</div>',
+               unsafe_allow_html=True)
+    transactions = _paper_ledger()
+    if transactions is None or transactions.empty:
+        st.info("Fund your paper trading account to start.")
+        with st.form("paper_fund"):
+            amount = st.number_input("Starting cash", min_value=1000.0, value=100000.0, step=1000.0)
+            funded = st.form_submit_button("Add funds", type="primary")
+        if funded:
+            as_of = prices.index[-1]
+            row = _paper_transaction("deposit", as_of, amount=float(amount), notes="Initial funding")
+            combined, _duplicates = append_transactions(transactions, row, as_of)
+            _persist_paper_ledger(combined)
+            st.rerun()
+        return
+    curated_funds = _curated_fund_catalog(fund_catalog) if fund_catalog is not None else None
+    try:
+        latest_all = _paper_valuation_prices(transactions, prices, data_root)
+        book = value_ledger(transactions, latest_all, prices.index[-1])
+    except ValueError as exc:
+        st.error(f"Paper account is inconsistent with the currently loaded prices: {exc}")
+        return
+    positions = book["positions"]
+    invested = float(positions.invested_cost.sum()) if not positions.empty else 0.0
+    total_pnl = book["unrealized_gain"] + book["realized_gain"]
+    total_pnl_pct = (total_pnl / invested) if invested else 0.0
+    if not positions.empty:
+        prev = _paper_prev_prices(transactions, prices, data_root).reindex(positions.index)
+        day_pnl = float((positions.quantity * (positions.latest_price - prev)).sum())
+    else:
+        day_pnl = 0.0
+    cols = st.columns(5)
+    cols[0].metric("Total value", metric(book["total_value"]))
+    cols[1].metric("Invested", metric(invested))
+    cols[2].metric("Total P&L", metric(total_pnl), f"{total_pnl_pct:+.2%}")
+    cols[3].metric("Today's P&L", metric(day_pnl))
+    cols[4].metric("Available cash", metric(book["cash_balance"]))
+    left, right = st.columns([2, 1])
+    with left:
+        tab_names = ["Stocks", "Mutual Funds", "Holdings", "Watchlist", "Orders"] if curated_funds is not None \
+            else ["Stocks", "Holdings", "Watchlist", "Orders"]
+        tabs = st.tabs(tab_names)
+        tab_map = dict(zip(tab_names, tabs))
+        with tab_map["Stocks"]:
+            _render_paper_explore(prices, symbol_meta)
+        if curated_funds is not None:
+            with tab_map["Mutual Funds"]:
+                _render_paper_funds_explore(curated_funds)
+        with tab_map["Holdings"]:
+            _render_paper_holdings(book, prices, symbol_meta, data_root)
+        with tab_map["Watchlist"]:
+            _render_paper_watchlist(prices, symbol_meta, data_root, curated_funds)
+        with tab_map["Orders"]:
+            _render_paper_orders(transactions, book)
+    with right:
+        _render_paper_order_ticket(prices, book, symbol_meta, data_root, curated_funds)
+    with st.expander("Manage paper account"):
+        manage_cols = st.columns(2)
+        with manage_cols[0]:
+            with st.form("paper_add_funds"):
+                amount = st.number_input("Amount", min_value=0.0, step=1000.0, value=0.0, key="paper_deposit_amount")
+                deposit = st.form_submit_button("Add funds")
+            if deposit and amount > 0:
+                as_of = prices.index[-1]
+                row = _paper_transaction("deposit", as_of, amount=float(amount), notes="Added funds")
+                combined, _duplicates = append_transactions(transactions, row, as_of)
+                _persist_paper_ledger(combined)
+                st.rerun()
+        with manage_cols[1]:
+            confirm = st.checkbox("Confirm reset (this deletes all paper orders and funding)")
+            if st.button("Reset paper account", disabled=not confirm):
+                path = _PAPER_ACCOUNT_ROOT / "paper_trading_account.json"
+                folder = _PAPER_ACCOUNT_ROOT / "paper_trading_account"
+                path.unlink(missing_ok=True)
+                if folder.exists():
+                    import shutil
+                    shutil.rmtree(folder)
+                st.session_state.pop("paper_ledger", None)
+                st.success("Paper trading account reset.")
+                st.rerun()
+
+
+def paper_trading_page():
+    # Its own data-loading sidebar rather than main()'s generic one: paper
+    # trading needs none of the ML allocation controls (strategy, solver,
+    # training window, risk limits, ...) that every other workspace page
+    # shares, so showing them here was pure clutter. "Real data (data lake)"
+    # is the default (unlike every other page, which defaults to the
+    # synthetic demo) because it's the only source with a real, searchable
+    # stock universe - matching what was actually asked for.
+    st.sidebar.subheader("Paper trading data")
+    source = st.sidebar.radio("Data source", ["Real data (data lake)", "Synthetic demo", "Upload CSV"],
+                              key="paper_source")
+    symbol_meta = None
+    data_root = None
+    fund_catalog = None
+    if source == "Real data (data lake)":
+        data_root_input = st.sidebar.text_input("Data root", value=str(resolve_data_root()), key="paper_data_root")
+        data_root = Path(data_root_input)
+        try:
+            universe = load_universe(data_root)
+        except MarketDataError as exc:
+            st.sidebar.error(str(exc))
+            return
+        symbols = tuple(universe.symbol)
+        start = str((pd.Timestamp.today() - pd.DateOffset(days=150)).date())
+        end = str(pd.Timestamp.today().date())
+        fingerprint_key = dataset_fingerprint(data_root, list(symbols), start, end)
+        try:
+            prices = paper_universe_prices(str(data_root), symbols, start, end, fingerprint_key)
+        except MarketDataError as exc:
+            st.error(str(exc))
+            return
+        symbol_meta = universe.set_index("symbol")[["name", "industry"]]
+        try:
+            catalog_path = data_root / "reference" / "mutual_fund_catalog.parquet"
+            fund_catalog = paper_fund_catalog(str(data_root), _mtime_fingerprint(catalog_path))
+        except MarketDataError:
+            fund_catalog = None  # mutual-fund-catalog pipeline step not run yet - stocks still work
+        if fund_catalog is not None:
+            fund_meta = fund_catalog.assign(symbol=fund_catalog["scheme_code"].astype(str)).set_index(
+                "symbol")[["scheme_name", "scheme_category"]].rename(
+                columns={"scheme_name": "name", "scheme_category": "industry"})
+            symbol_meta = pd.concat([symbol_meta, fund_meta])
+    elif source == "Synthetic demo":
+        seed = st.sidebar.number_input("Demo seed", min_value=1, max_value=9999, value=42, key="paper_seed")
+        periods = st.sidebar.slider("Demo trading days", 130, 2600, 520, 20, key="paper_periods")
+        prices = demo_prices(periods, seed, str(pd.Timestamp.today().date()))
+    else:
+        uploaded = st.sidebar.file_uploader("Price CSV", type=["csv"], key="paper_upload")
+        if uploaded is None:
+            st.info("Upload a CSV, or switch Data source in the sidebar.")
+            return
+        try:
+            prices = uploaded_prices(uploaded.getvalue())
+        except Exception as exc:
+            st.error(str(exc))
+            return
+    if len(prices) < 2:
+        st.error("At least 2 rows of price data are required.")
+        return
+    paper_trading_view(prices, symbol_meta, data_root, fund_catalog)
+
+
+def research_registry_view():
+    st.subheader("Research Registry")
+    st.caption("Every saved proposal, research run, research report, strategy run, and sweep in one "
+              "place, tagged with the question it set out to answer and what was concluded.")
+    root = ROOT / "experiments"
+    experiments = cached_experiments(_experiments_fingerprint(root))
+    summary = summarize_experiments(experiments)
+    if summary["total"] == 0:
+        st.info("No experiments saved yet. Save a research run, report, strategy run, or sweep to see it here.")
+        return
+    cols = st.columns(1 + len(VALID_STATUSES))
+    cols[0].metric("Total experiments", summary["total"])
+    for col, status in zip(cols[1:], VALID_STATUSES):
+        col.metric(status.capitalize(), summary["by_status"][status])
+
+    with st.expander("Filters", expanded=False):
+        kind_options = sorted(experiments.kind.unique())
+        kinds = st.multiselect("Kind", kind_options, default=kind_options, key="registry_kind_filter")
+        statuses = st.multiselect("Status", list(VALID_STATUSES), default=list(VALID_STATUSES),
+                                  key="registry_status_filter")
+    filtered = experiments[experiments.kind.isin(kinds) & experiments.status.isin(statuses)]
+    st.dataframe(filtered.drop(columns=["path"]), width="stretch", hide_index=True)
+
+    st.subheader("Tag or update an experiment")
+    if filtered.empty:
+        st.info("No experiments match the current filters.")
+        return
+    options = dict(zip(filtered.path, filtered.id + " | " + filtered.kind + " | " + filtered.name))
+    selected_path = st.selectbox("Experiment", list(options), format_func=options.get, key="registry_selected")
+    row = filtered.set_index("path").loc[selected_path]
+    with st.form("registry_edit"):
+        research_question = st.text_area("Research question", value=row.research_question or "")
+        hypothesis = st.text_area("Hypothesis", value=row.hypothesis or "")
+        status = st.selectbox("Status", list(VALID_STATUSES), index=list(VALID_STATUSES).index(row.status))
+        conclusion = st.text_area("Conclusion", value=row.conclusion or "",
+                                  help="Why this was marked supported/falsified/inconclusive - "
+                                       "the evidence, not just the label.")
+        parent_id = st.text_input("Parent experiment id", value=row.parent_id or "",
+                                  help="Links this to the prior experiment it builds on, for tracing a line of research.")
+        submitted = st.form_submit_button("Update")
+    if submitted:
+        try:
+            set_research_meta(Path(selected_path), research_question=research_question.strip(),
+                              hypothesis=hypothesis.strip(), status=status,
+                              conclusion=conclusion.strip(), parent_id=parent_id.strip() or None)
+            st.success("Updated.")
+            st.rerun()
+        except (ValueError, OSError) as exc:
+            st.error(f"Could not update: {exc}")
+
+    if row.kind == "strategy_run":
+        st.subheader("Robustness / Falsification Checks")
+        st.caption("Reruns this saved Strategy Copilot run under cost stress, chronological "
+                  "sub-periods, parameter perturbation, a randomized-selection placebo, and a "
+                  "bootstrap confidence interval - a structured evidence bundle, not a single Sharpe.")
+        if st.button("Run robustness checks", key="run_robustness"):
+            try:
+                payload = load_strategy_run(Path(selected_path))
+                strategy_prices = payload["prices"]
+                strategy = payload["result"]["strategy"]
+                assumptions = payload["result"]["assumptions"]
+                with st.spinner("Running cost stress, sub-periods, perturbation, placebo, and bootstrap..."):
+                    bundle = run_robustness_checks(strategy_prices, strategy,
+                                                   evaluation_start=assumptions["evaluation_start"],
+                                                   evaluation_end=assumptions["evaluation_end"])
+                st.session_state["robustness_bundle"] = {"path": selected_path, "bundle": bundle}
+            except ValueError as exc:
+                st.session_state.pop("robustness_bundle", None)
+                st.error(f"Could not run robustness checks: {exc}")
+        saved_bundle = st.session_state.get("robustness_bundle")
+        if saved_bundle and saved_bundle["path"] == selected_path:
+            bundle = saved_bundle["bundle"]
+            verdict_cols = st.columns(2)
+            verdict_cols[0].metric("Verdict", bundle["verdict"].capitalize())
+            verdict_cols[1].metric("Checks passed", f"{bundle['checks_passed']}/{bundle['checks_total']}")
+            st.dataframe(pd.DataFrame([bundle["checks"]]).T.rename(columns={0: "passed"}), width="stretch")
+            cost_tab, sub_tab, perturb_tab, placebo_tab, bootstrap_tab = st.tabs(
+                ["Cost stress", "Sub-periods", "Parameter perturbation", "Placebo", "Bootstrap"])
+            with cost_tab:
+                st.dataframe(bundle["cost_stress"], width="stretch", hide_index=True)
+            with sub_tab:
+                st.dataframe(bundle["subperiods"], width="stretch", hide_index=True)
+            with perturb_tab:
+                st.dataframe(bundle["parameter_perturbation"], width="stretch", hide_index=True)
+            with placebo_tab:
+                st.dataframe(bundle["placebo"], width="stretch", hide_index=True)
+                st.caption(f"Real strategy Sharpe: {metric(bundle['baseline_metrics']['Sharpe'])} | "
+                          f"placebo mean Sharpe: {metric(bundle['placebo']['Sharpe'].mean())}")
+            with bootstrap_tab:
+                st.json(bundle["bootstrap"])
+            report_name = st.text_input("Robustness report name", value=f"{row['name']} robustness",
+                                        key="robustness_report_name")
+            if st.button("Save report and apply verdict to registry", key="save_robustness"):
+                try:
+                    # Reloaded rather than reused from the "Run" button's scope above:
+                    # that local only exists on the rerun where that button was
+                    # clicked, not on this button's own later rerun.
+                    strategy_prices = load_strategy_run(Path(selected_path))["prices"]
+                    report_path = save_robustness_report(root, report_name, strategy_prices, row.id, bundle)
+                    conclusion = verdict_conclusion(bundle["checks"])
+                    set_research_meta(Path(selected_path), status=bundle["verdict"], conclusion=conclusion)
+                    set_research_meta(report_path, status=bundle["verdict"], parent_id=row.id,
+                                      conclusion=conclusion)
+                    st.session_state.pop("robustness_bundle", None)
+                    st.success(f"Saved robustness report {report_path.stem} and set the strategy run's "
+                              f"status to '{bundle['verdict']}'.")
+                    st.rerun()
+                except (ValueError, OSError) as exc:
+                    st.error(f"Could not save robustness report: {exc}")
+
+
 def main():
+    page = st.sidebar.radio("Workspace", ["Portfolio", "Paper Trading", "Options Lab", "Research",
+                                          "Research Agent", "Strategy Copilot", "Saved Decisions",
+                                          "Research Registry"])
+    if page == "Paper Trading":
+        paper_trading_page()
+        return
+    if page == "Options Lab":
+        options_lab_page()
+        return
+    if page == "Research Registry":
+        research_registry_view()
+        return
     st.title("ML Portfolio Allocation")
-    page = st.sidebar.radio("Workspace", ["Portfolio", "Research", "Research Agent",
-                                          "Strategy Copilot", "Saved Decisions"])
     source = st.sidebar.radio("Data source", ["Synthetic demo", "Upload CSV", "Real data (data lake)"])
     if source == "Synthetic demo":
         seed = st.sidebar.number_input("Demo seed", min_value=1, max_value=9999, value=42)
