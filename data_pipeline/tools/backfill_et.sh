@@ -14,7 +14,7 @@ for y in $(seq 2026 -1 2016); do
     py -3.14 -m data_pipeline.run news-fulltext --source et --month "$y-$mm" --rps "$RPS" --workers "$WORKERS" 2>&1 | grep -v "it/s\|art/s"
     rc=${PIPESTATUS[0]}
     echo "$(date '+%F %T') END $y-$mm rc=$rc"
-    if [ "$rc" = 3 ]; then echo "$(date '+%F %T') BRAKE - stopped"; exit 3; fi
+    if [ "$rc" != 0 ]; then echo "$(date '+%F %T') STOPPED rc=$rc (brake=3, other errors e.g. HTTP 403)"; exit "$rc"; fi
   done
 done
 echo "$(date '+%F %T') ALL DONE"

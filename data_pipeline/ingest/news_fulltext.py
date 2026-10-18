@@ -15,14 +15,23 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
 from tqdm import tqdm
 
-from ..config import PipelineConfig, RateLimit
+from ..config import (
+    FULLTEXT_CHUNK,
+    FULLTEXT_EXTRACT_PROCESSES,
+    FULLTEXT_FULL_MIN_CHARS,
+    FULLTEXT_SAVE_EVERY,
+    FULLTEXT_THROTTLE_LIMIT,
+    FULLTEXT_USER_AGENT,
+    PipelineConfig,
+    RateLimit,
+)
 from ..entities import load_matcher
 from ..http import HttpClient
 from ..io import write_parquet
@@ -31,9 +40,9 @@ from ..sources import sitemap_news as sm
 LOG = logging.getLogger("data_pipeline.ingest.news_fulltext")
 
 SOURCE_NAMES = {"et": "Economic Times"}
-FULL_MIN_CHARS = 300      # body at least this long -> "full"
-CHUNK = 200               # write to disk every CHUNK articles so progress survives a crash
-THROTTLE_LIMIT = 0.01     # stop the run if more than 1% of a batch is throttled
+
+
+_HEADERS = {"User-Agent": FULLTEXT_USER_AGENT}
 
 
 class ThrottleBrake(RuntimeError):
@@ -43,7 +52,7 @@ class ThrottleBrake(RuntimeError):
 
 def _is_throttled(reason: str | None) -> bool:
     return bool(reason) and (reason.startswith("throttled") or reason.startswith("http 429")
-                             or reason.startswith("http 5"))
+                             or reason.startswith("http 5") or reason.startswith("blocked"))
 
 
 def _article_id(url: str) -> str:
@@ -106,16 +115,19 @@ def _authors(raw: str | None) -> list[str]:
     return names
 
 
-def _process(item, source: str, client: HttpClient, matcher, host_key: str) -> dict:
+def _process(item, source: str, client: HttpClient, matcher, host_key: str, extract_fn) -> dict:
     url, lastmod = item
     scraped_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     sitemap_date = pd.Timestamp(lastmod) if lastmod else None
 
     try:
-        resp = client.get(url, host_key=host_key, expect_json=False)
+        resp = client.get(url, host_key=host_key, expect_json=False, headers=_HEADERS)
     except Exception as exc:  # noqa: BLE001 - recorded as a failed row, not raised
         # RetryableHTTPError is raised for 429 / 5xx after the client's own retries
         reason = "throttled" if type(exc).__name__ == "RetryableHTTPError" else f"fetch: {type(exc).__name__}"
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        if status == 403:
+            reason = "blocked 403"  # publisher refused this connection: the brake must trip
         return _row(source, url, lastmod, scraped_at, published_at=sitemap_date,
                     date_source="sitemap_lastmod" if sitemap_date is not None else None,
                     completeness="failed", failure_reason=reason)
@@ -125,7 +137,7 @@ def _process(item, source: str, client: HttpClient, matcher, host_key: str) -> d
                     completeness="failed", failure_reason=f"http {resp.status_code}")
 
     try:
-        art = sm.extract(resp.text)
+        art = extract_fn(resp.text)
     except Exception as exc:  # noqa: BLE001
         art = None
         reason = f"extract: {type(exc).__name__}"
@@ -146,7 +158,7 @@ def _process(item, source: str, client: HttpClient, matcher, host_key: str) -> d
         published_at = sitemap_date
         date_source = "sitemap_lastmod" if sitemap_date is not None else None
 
-    if len(body) >= FULL_MIN_CHARS:
+    if len(body) >= FULLTEXT_FULL_MIN_CHARS:
         completeness = "full"
     elif body:
         completeness = "partial"
@@ -194,7 +206,7 @@ def run(
              cfg.rate_limits[host_key].rps, workers)
 
     client = HttpClient(cfg)
-    idx = client.get(sm.SITEMAP_INDEXES[source], host_key=host_key, expect_json=False)
+    idx = client.get(sm.SITEMAP_INDEXES[source], host_key=host_key, expect_json=False, headers=_HEADERS)
     if idx.status_code != 200:
         LOG.error("news-fulltext: sitemap index returned HTTP %s", idx.status_code)
         return
@@ -206,7 +218,7 @@ def run(
     entries: list[tuple[str, object]] = []
     seen: set[str] = set()
     for part in parts:
-        resp = client.get(part, host_key=host_key, expect_json=False)
+        resp = client.get(part, host_key=host_key, expect_json=False, headers=_HEADERS)
         if resp.status_code != 200:
             LOG.error("news-fulltext: %s returned HTTP %s", part, resp.status_code)
             return
@@ -228,21 +240,44 @@ def run(
 
     matcher = load_matcher(cfg)
     counts = {"full": 0, "partial": 0, "headline_only": 0, "failed": 0}
-    with ThreadPoolExecutor(max_workers=workers) as pool, tqdm(total=len(todo), desc=f"{source} {month}", unit="art") as bar:
-        for start in range(0, len(todo), CHUNK):
-            chunk = todo[start:start + CHUNK]
-            rows = list(pool.map(lambda e: _process(e, source, client, matcher, host_key), chunk))
-            for r in rows:
-                counts[r["completeness"]] += 1
-            write_parquet(pd.DataFrame(rows), path, primary_key=["article_id"])
-            bar.update(len(chunk))
-            throttled = sum(_is_throttled(r["failure_reason"]) for r in rows)
-            if throttled and (throttled / len(rows) > THROTTLE_LIMIT
-                              or any(r["failure_reason"] == "http 429" for r in rows)):
-                raise ThrottleBrake(
-                    f"{throttled}/{len(rows)} articles throttled at {month} "
-                    f"(rate {cfg.rate_limits[host_key].rps} req/s). Saved so far; "
-                    f"re-run at a lower --rps to resume."
-                )
+    # Extraction is CPU work; Python threads share one core for it (the GIL). Threads
+    # wait on the process pool instead, so extraction runs on several cores at once.
+    with ProcessPoolExecutor(max_workers=FULLTEXT_EXTRACT_PROCESSES) as extract_pool, \
+            ThreadPoolExecutor(max_workers=workers) as pool, \
+            tqdm(total=len(todo), desc=f"{source} {month}", unit="art") as bar:
+        def extract_fn(html: str):
+            return extract_pool.submit(sm.extract, html).result()
+
+        pending: list[dict] = []
+
+        def flush() -> None:
+            # Every write merges into and rewrites the whole month file, so it is batched
+            # (FULLTEXT_SAVE_EVERY) instead of done after every small fetch batch.
+            if pending:
+                write_parquet(pd.DataFrame(pending), path, primary_key=["article_id"])
+                pending.clear()
+
+        try:
+            for start in range(0, len(todo), FULLTEXT_CHUNK):
+                chunk = todo[start:start + FULLTEXT_CHUNK]
+                rows = list(pool.map(lambda e: _process(e, source, client, matcher, host_key, extract_fn), chunk))
+                for r in rows:
+                    counts[r["completeness"]] += 1
+                pending.extend(rows)
+                bar.update(len(chunk))
+                if len(pending) >= FULLTEXT_SAVE_EVERY:
+                    flush()
+                # the brake is still checked after every small batch, so a block stops quickly
+                throttled = sum(_is_throttled(r["failure_reason"]) for r in rows)
+                if throttled and (throttled / len(rows) > FULLTEXT_THROTTLE_LIMIT
+                                  or any(r["failure_reason"] == "http 429" or
+                                         (r["failure_reason"] or "").startswith("blocked") for r in rows)):
+                    raise ThrottleBrake(
+                        f"{throttled}/{len(rows)} articles throttled at {month} "
+                        f"(rate {cfg.rate_limits[host_key].rps} req/s). Saved so far; "
+                        f"re-run at a lower --rps to resume."
+                    )
+        finally:
+            flush()   # also runs when the brake (or an error) stops the run, so nothing fetched is lost
 
     LOG.info("news-fulltext %s %s: %s -> %s", source, month, counts, path)

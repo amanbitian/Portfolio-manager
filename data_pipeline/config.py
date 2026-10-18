@@ -25,6 +25,20 @@ MINUTE_START = date(2022, 1, 1)
 # News backfill defaults to a rolling window; full history is a separate long job.
 NEWS_BACKFILL_YEARS = 3
 
+# Full-text news from publisher sitemaps (ingest/news_fulltext.py). The run-time request
+# rate and fetch-worker count come from the command line (--rps, --workers) so a running
+# job's values are visible in its launch command; these are the defaults.
+FULLTEXT_ET_RPS = 8.0            # article requests per second to Economic Times
+FULLTEXT_WORKERS = 10            # fetch threads
+FULLTEXT_EXTRACT_PROCESSES = 30  # CPU processes for text extraction (~0.03 s CPU per article)
+FULLTEXT_CHUNK = 200             # articles per batch; the block/throttle brake is checked after each batch
+FULLTEXT_SAVE_EVERY = 2000       # rows buffered before writing the month file (each write rewrites the
+                                 # whole file, ~20 s on the HDD for a full month, so write rarely)
+FULLTEXT_THROTTLE_LIMIT = 0.01   # stop the run if more than this share of a batch is throttled
+FULLTEXT_FULL_MIN_CHARS = 300    # body at least this long is completeness "full"
+# Sent to publishers instead of a browser-style string, so they can see what is crawling.
+FULLTEXT_USER_AGENT = "trendfinder"
+
 
 @dataclass(frozen=True)
 class RateLimit:
@@ -57,7 +71,7 @@ class PipelineConfig:
             "yfinance": RateLimit(rps=1.5),
             "assets": RateLimit(rps=2.0),
             "screener": RateLimit(rps=0.22),   # be gentle: ~1 request / 4.5s
-            "et_news": RateLimit(rps=8.0),     # full-text article pages from economictimes.indiatimes.com
+            "et_news": RateLimit(rps=FULLTEXT_ET_RPS),  # full-text article pages (Economic Times)
         }
     )
     http_retries: int = 5
