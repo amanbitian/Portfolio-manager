@@ -22,7 +22,7 @@ from pathlib import Path
 import pandas as pd
 from tqdm import tqdm
 
-from ..config import PipelineConfig
+from ..config import PipelineConfig, RateLimit
 from ..entities import load_matcher
 from ..http import HttpClient
 from ..io import write_parquet
@@ -33,6 +33,17 @@ LOG = logging.getLogger("data_pipeline.ingest.news_fulltext")
 SOURCE_NAMES = {"et": "Economic Times"}
 FULL_MIN_CHARS = 300      # body at least this long -> "full"
 CHUNK = 200               # write to disk every CHUNK articles so progress survives a crash
+THROTTLE_LIMIT = 0.01     # stop the run if more than 1% of a batch is throttled
+
+
+class ThrottleBrake(RuntimeError):
+    """The publisher is pushing back (429 / repeated 5xx). The run stops after saving
+    the batch it was on, so the rate can be lowered before anything else is requested."""
+
+
+def _is_throttled(reason: str | None) -> bool:
+    return bool(reason) and (reason.startswith("throttled") or reason.startswith("http 429")
+                             or reason.startswith("http 5"))
 
 
 def _article_id(url: str) -> str:
@@ -103,9 +114,11 @@ def _process(item, source: str, client: HttpClient, matcher, host_key: str) -> d
     try:
         resp = client.get(url, host_key=host_key, expect_json=False)
     except Exception as exc:  # noqa: BLE001 - recorded as a failed row, not raised
+        # RetryableHTTPError is raised for 429 / 5xx after the client's own retries
+        reason = "throttled" if type(exc).__name__ == "RetryableHTTPError" else f"fetch: {type(exc).__name__}"
         return _row(source, url, lastmod, scraped_at, published_at=sitemap_date,
                     date_source="sitemap_lastmod" if sitemap_date is not None else None,
-                    completeness="failed", failure_reason=f"fetch: {type(exc).__name__}")
+                    completeness="failed", failure_reason=reason)
     if resp.status_code != 200:
         return _row(source, url, lastmod, scraped_at, published_at=sitemap_date,
                     date_source="sitemap_lastmod" if sitemap_date is not None else None,
@@ -167,6 +180,7 @@ def run(
     month: str,
     limit: int | None = None,
     workers: int = 4,
+    rps: float | None = None,
 ) -> None:
     if source not in sm.SITEMAPS:
         raise ValueError(f"no sitemap configured for source {source!r}")
@@ -174,6 +188,10 @@ def run(
     cfg.ensure_dirs()
     path = _out_path(cfg, source, year, mon)
     host_key = f"{source}_news"
+    if rps is not None:
+        cfg.rate_limits[host_key] = RateLimit(rps=rps)
+    LOG.info("news-fulltext %s %s: rate %.1f req/s, %d workers", source, month,
+             cfg.rate_limits[host_key].rps, workers)
 
     client = HttpClient(cfg)
     idx = client.get(sm.SITEMAP_INDEXES[source], host_key=host_key, expect_json=False)
@@ -218,5 +236,13 @@ def run(
                 counts[r["completeness"]] += 1
             write_parquet(pd.DataFrame(rows), path, primary_key=["article_id"])
             bar.update(len(chunk))
+            throttled = sum(_is_throttled(r["failure_reason"]) for r in rows)
+            if throttled and (throttled / len(rows) > THROTTLE_LIMIT
+                              or any(r["failure_reason"] == "http 429" for r in rows)):
+                raise ThrottleBrake(
+                    f"{throttled}/{len(rows)} articles throttled at {month} "
+                    f"(rate {cfg.rate_limits[host_key].rps} req/s). Saved so far; "
+                    f"re-run at a lower --rps to resume."
+                )
 
     LOG.info("news-fulltext %s %s: %s -> %s", source, month, counts, path)

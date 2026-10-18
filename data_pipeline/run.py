@@ -162,6 +162,7 @@ def main(argv: list[str] | None = None) -> int:
     p_ft.add_argument("--month", required=True, help="YYYY-MM")
     p_ft.add_argument("--limit", type=int, help="max articles to fetch this run")
     p_ft.add_argument("--workers", type=int, default=4, help="parallel fetch workers")
+    p_ft.add_argument("--rps", type=float, help="requests per second to the publisher (default: config)")
 
     sub.add_parser("status", help="manifest + disk summary")
     sub.add_parser("all", help="universe -> 1day -> corp-actions -> fundamentals -> macro -> news pilot")
@@ -268,13 +269,18 @@ def main(argv: list[str] | None = None) -> int:
     elif args.cmd == "news-fulltext":
         from .ingest import news_fulltext
 
-        news_fulltext.run(
-            cfg,
-            source=args.source,
-            month=args.month,
-            limit=args.limit,
-            workers=args.workers,
-        )
+        try:
+            news_fulltext.run(
+                cfg,
+                source=args.source,
+                month=args.month,
+                limit=args.limit,
+                workers=args.workers,
+                rps=args.rps,
+            )
+        except news_fulltext.ThrottleBrake as exc:
+            print(f"STOPPED (throttle brake): {exc}", file=sys.stderr)
+            raise SystemExit(3)
     elif args.cmd == "status":
         cmd_status(cfg)
     elif args.cmd == "all":
