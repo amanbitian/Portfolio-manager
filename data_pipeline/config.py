@@ -32,9 +32,16 @@ FULLTEXT_ET_RPS = 8.0            # article requests per second to Economic Times
 FULLTEXT_WORKERS = 10            # fetch threads
 FULLTEXT_EXTRACT_PROCESSES = 30  # CPU processes for text extraction (~0.03 s CPU per article)
 FULLTEXT_CHUNK = 200             # articles per batch; the block/throttle brake is checked after each batch
+FULLTEXT_STALL_SECONDS = 300     # if no article finishes for this long the run is stuck: save, exit with code 4
+                                 # (the driver script then retries the month)
+FULLTEXT_PROGRESS_EVERY = 1000   # log a progress line every N articles, so a stall is visible in the log
 FULLTEXT_SAVE_EVERY = 2000       # rows buffered before writing the month file (each write rewrites the
                                  # whole file, ~20 s on the HDD for a full month, so write rarely)
 FULLTEXT_THROTTLE_LIMIT = 0.01   # stop the run if more than this share of a batch is throttled
+# On HTTP 403: rows are saved, then one retry request is sent at each of these minutes, counted from
+# the 403. A retry that still gets 403 waits for the next one; when the list runs out the run stops.
+# After a successful retry the schedule starts again at the first entry for the next 403.
+FULLTEXT_BLOCK_RETRY_MINUTES = [5, 10, 15, 20, 25, 30]
 FULLTEXT_FULL_MIN_CHARS = 300    # body at least this long is completeness "full"
 # Sent to publishers instead of a browser-style string, so they can see what is crawling.
 FULLTEXT_USER_AGENT = "trendfinder"

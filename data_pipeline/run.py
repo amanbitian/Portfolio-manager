@@ -21,7 +21,41 @@ import sys
 from datetime import datetime
 
 from .checkpoint import Manifest
-from .config import PipelineConfig, load_config
+from .config import (
+    FULLTEXT_BLOCK_RETRY_MINUTES,
+    PipelineConfig,
+    load_config,
+)
+
+
+def _site_open() -> bool:
+    """One request to the sitemap index: True if the site no longer refuses us."""
+    import requests
+
+    from .ingest.news_fulltext import _HEADERS
+    from .sources import sitemap_news as sm
+
+    r = requests.get(sm.SITEMAP_INDEXES["et"], headers=_HEADERS, timeout=30)
+    return r.status_code != 403
+
+
+def _wait_for_block_to_clear(exc: Exception) -> bool:
+    """Retry at FULLTEXT_BLOCK_RETRY_MINUTES after the 403 (5, 10, 15, ... min). Each retry is one
+    request. Returns True as soon as the site answers, False when the schedule runs out."""
+    import time
+
+    start = time.monotonic()
+    total = len(FULLTEXT_BLOCK_RETRY_MINUTES)
+    print(f"403 from the site ({exc}). Rows so far are saved. Schedule: retry at "
+          f"{', '.join(str(m) for m in FULLTEXT_BLOCK_RETRY_MINUTES)} min after this 403.", file=sys.stderr)
+    for i, minutes in enumerate(FULLTEXT_BLOCK_RETRY_MINUTES, 1):
+        time.sleep(max(0.0, start + minutes * 60 - time.monotonic()))
+        if _site_open():
+            print(f"Retry {i} of {total} at {minutes} min: site answers again. Resuming; "
+                  f"the schedule restarts at 5 min for the next 403.", file=sys.stderr)
+            return True
+        print(f"Retry {i} of {total} at {minutes} min: still 403.", file=sys.stderr)
+    return False
 from .io import dir_size_mb
 
 
@@ -269,18 +303,30 @@ def main(argv: list[str] | None = None) -> int:
     elif args.cmd == "news-fulltext":
         from .ingest import news_fulltext
 
-        try:
-            news_fulltext.run(
-                cfg,
-                source=args.source,
-                month=args.month,
-                limit=args.limit,
-                workers=args.workers,
-                rps=args.rps,
-            )
-        except news_fulltext.ThrottleBrake as exc:
-            print(f"STOPPED (throttle brake): {exc}", file=sys.stderr)
-            raise SystemExit(3)
+        import requests
+
+        while True:
+            try:
+                news_fulltext.run(
+                    cfg,
+                    source=args.source,
+                    month=args.month,
+                    limit=args.limit,
+                    workers=args.workers,
+                    rps=args.rps,
+                )
+                break
+            except (news_fulltext.BlockedBrake, requests.HTTPError) as exc:
+                # a 403 from the sitemap listing is a block too; any other HTTP error is not
+                if isinstance(exc, requests.HTTPError) and getattr(exc.response, "status_code", None) != 403:
+                    raise
+                # rows so far are already saved; wait for the site, then carry on
+                if not _wait_for_block_to_clear(exc):
+                    print(f"STOPPED: still blocked after all retries: {exc}", file=sys.stderr)
+                    raise SystemExit(3)
+            except news_fulltext.ThrottleBrake as exc:
+                print(f"STOPPED (throttle brake): {exc}", file=sys.stderr)
+                raise SystemExit(3)
     elif args.cmd == "status":
         cmd_status(cfg)
     elif args.cmd == "all":

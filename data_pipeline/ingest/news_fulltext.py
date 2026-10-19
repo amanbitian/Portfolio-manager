@@ -14,7 +14,9 @@ rows are retried and replaced on the next run (primary key article_id).
 from __future__ import annotations
 
 import hashlib
+import itertools
 import logging
+import os
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,7 +28,9 @@ from ..config import (
     FULLTEXT_CHUNK,
     FULLTEXT_EXTRACT_PROCESSES,
     FULLTEXT_FULL_MIN_CHARS,
+    FULLTEXT_PROGRESS_EVERY,
     FULLTEXT_SAVE_EVERY,
+    FULLTEXT_STALL_SECONDS,
     FULLTEXT_THROTTLE_LIMIT,
     FULLTEXT_USER_AGENT,
     PipelineConfig,
@@ -50,6 +54,40 @@ class ThrottleBrake(RuntimeError):
     the batch it was on, so the rate can be lowered before anything else is requested."""
 
 
+class BlockedBrake(ThrottleBrake):
+    """HTTP 403: the publisher refused this connection. Rows are saved first; the caller
+    pauses and retries (FULLTEXT_BLOCK_PAUSE_SECONDS) instead of stopping outright."""
+
+
+class StallError(RuntimeError):
+    """Nothing finished for FULLTEXT_STALL_SECONDS: a request or an extraction is stuck."""
+
+
+# A retry cannot change these, so a failed row with one of them counts as done.
+_PERMANENT_FAILURES = ("http 404", "http 410", "redirect loop")
+
+
+def _stream(pool, fn, items, window: int, stall_seconds: float = FULLTEXT_STALL_SECONDS):
+    """Yield fn(item) for each item as soon as it finishes, keeping at most `window` in flight.
+    Unlike pool.map over a batch, one slow item never holds up the rest. Raises StallError if
+    nothing at all finishes for `stall_seconds`, so a hang cannot go unnoticed."""
+    from concurrent.futures import FIRST_COMPLETED, wait
+
+    it = iter(items)
+    inflight = set()
+    for item in itertools.islice(it, window):
+        inflight.add(pool.submit(fn, item))
+    while inflight:
+        done, inflight = wait(inflight, timeout=stall_seconds, return_when=FIRST_COMPLETED)
+        if not done:
+            raise StallError(f"no article finished in {stall_seconds:.0f} s with {len(inflight)} in flight")
+        for fut in done:
+            yield fut.result()
+            nxt = next(it, None)
+            if nxt is not None:
+                inflight.add(pool.submit(fn, nxt))
+
+
 def _is_throttled(reason: str | None) -> bool:
     return bool(reason) and (reason.startswith("throttled") or reason.startswith("http 429")
                              or reason.startswith("http 5") or reason.startswith("blocked"))
@@ -66,8 +104,9 @@ def _out_path(cfg: PipelineConfig, source: str, year: int, month: int) -> Path:
 def _done_ids(path: Path) -> set[str]:
     if not path.exists():
         return set()
-    df = pd.read_parquet(path, columns=["article_id", "completeness"])
-    return set(df.loc[df["completeness"] != "failed", "article_id"])
+    df = pd.read_parquet(path, columns=["article_id", "completeness", "failure_reason"])
+    permanent = df["failure_reason"].fillna("").str.startswith(_PERMANENT_FAILURES)
+    return set(df.loc[(df["completeness"] != "failed") | permanent, "article_id"])
 
 
 def _parse_date(value: str | None) -> pd.Timestamp | None:
@@ -128,6 +167,10 @@ def _process(item, source: str, client: HttpClient, matcher, host_key: str, extr
         status = getattr(getattr(exc, "response", None), "status_code", None)
         if status == 403:
             reason = "blocked 403"  # publisher refused this connection: the brake must trip
+        elif status in (404, 410):
+            reason = f"http {status}"   # page removed: permanent, not retried on later runs
+        elif type(exc).__name__ == "TooManyRedirects":
+            reason = "redirect loop"    # permanent for this page; says nothing about rate limits
         return _row(source, url, lastmod, scraped_at, published_at=sitemap_date,
                     date_source="sitemap_lastmod" if sitemap_date is not None else None,
                     completeness="failed", failure_reason=reason)
@@ -257,26 +300,42 @@ def run(
                 write_parquet(pd.DataFrame(pending), path, primary_key=["article_id"])
                 pending.clear()
 
+        def check_brake(rows: list[dict]) -> None:
+            # a 403 always stops the run; throttling stops it only on a large enough sample
+            if any((r["failure_reason"] or "").startswith("blocked") for r in rows):
+                raise BlockedBrake(f"403 at {month} (rate {cfg.rate_limits[host_key].rps} req/s). Saved so far.")
+            throttled = sum(_is_throttled(r["failure_reason"]) for r in rows)
+            if len(rows) >= 50 and throttled and (throttled / len(rows) > FULLTEXT_THROTTLE_LIMIT
+                                                  or any(r["failure_reason"] == "http 429" for r in rows)):
+                raise ThrottleBrake(
+                    f"{throttled}/{len(rows)} articles throttled at {month} "
+                    f"(rate {cfg.rate_limits[host_key].rps} req/s). Saved so far; "
+                    f"re-run at a lower --rps to resume."
+                )
+
         try:
-            for start in range(0, len(todo), FULLTEXT_CHUNK):
-                chunk = todo[start:start + FULLTEXT_CHUNK]
-                rows = list(pool.map(lambda e: _process(e, source, client, matcher, host_key, extract_fn), chunk))
-                for r in rows:
-                    counts[r["completeness"]] += 1
-                pending.extend(rows)
-                bar.update(len(chunk))
+            batch: list[dict] = []
+            for row in _stream(pool, lambda e: _process(e, source, client, matcher, host_key, extract_fn),
+                               todo, window=workers * 4):
+                counts[row["completeness"]] += 1
+                pending.append(row)
+                batch.append(row)
+                bar.update(1)
+                if bar.n % FULLTEXT_PROGRESS_EVERY == 0:
+                    LOG.info("news-fulltext %s %s: %d/%d fetched %s", source, month, bar.n, len(todo), counts)
                 if len(pending) >= FULLTEXT_SAVE_EVERY:
                     flush()
-                # the brake is still checked after every small batch, so a block stops quickly
-                throttled = sum(_is_throttled(r["failure_reason"]) for r in rows)
-                if throttled and (throttled / len(rows) > FULLTEXT_THROTTLE_LIMIT
-                                  or any(r["failure_reason"] == "http 429" or
-                                         (r["failure_reason"] or "").startswith("blocked") for r in rows)):
-                    raise ThrottleBrake(
-                        f"{throttled}/{len(rows)} articles throttled at {month} "
-                        f"(rate {cfg.rate_limits[host_key].rps} req/s). Saved so far; "
-                        f"re-run at a lower --rps to resume."
-                    )
+                if len(batch) >= FULLTEXT_CHUNK:
+                    check_brake(batch)
+                    batch = []
+            if batch:
+                check_brake(batch)
+        except StallError as exc:
+            flush()
+            LOG.error("news-fulltext %s %s: STALLED, %s. Saved %d rows; exiting with code 4 so the "
+                      "driver retries the month.", source, month, exc, sum(counts.values()))
+            logging.shutdown()
+            os._exit(4)   # a stuck worker would block the normal shutdown, so leave immediately
         finally:
             flush()   # also runs when the brake (or an error) stops the run, so nothing fetched is lost
 

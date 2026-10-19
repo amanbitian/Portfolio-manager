@@ -9,7 +9,7 @@ from typing import Any
 import requests
 from tenacity import (
     retry,
-    retry_if_exception_type,
+    retry_if_exception,
     stop_after_attempt,
     wait_exponential_jitter,
 )
@@ -24,6 +24,16 @@ _BROWSER_UA = (
 
 class RetryableHTTPError(RuntimeError):
     """Raised for 429/5xx responses so tenacity retries them."""
+
+
+def _should_retry(exc: BaseException) -> bool:
+    """Retry 429/5xx and network failures. Never retry other 4xx: a 403, 404 or 410 will not
+    change on a retry, and retrying it only spends time and rate-limit budget."""
+    if isinstance(exc, RetryableHTTPError):
+        return True
+    return isinstance(exc, requests.exceptions.RequestException) and not isinstance(
+        exc, (requests.exceptions.HTTPError, requests.exceptions.TooManyRedirects)
+    )
 
 
 class _RateLimiter:
@@ -54,6 +64,11 @@ class HttpClient:
         self._limiter = _RateLimiter()
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": _BROWSER_UA})
+        # The default pool keeps 10 connections per host. With more worker threads than that, every
+        # extra request opens and then discards a connection ("Connection pool is full" warnings).
+        adapter = requests.adapters.HTTPAdapter(pool_connections=64, pool_maxsize=64)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
 
     def _rps_for(self, host_key: str) -> float:
         rl = self.cfg.rate_limits.get(host_key)
@@ -73,9 +88,7 @@ class HttpClient:
         """GET with rate limiting + retry. Returns parsed JSON or the Response."""
 
         @retry(
-            retry=retry_if_exception_type(
-                (RetryableHTTPError, requests.exceptions.RequestException)
-            ),
+            retry=retry_if_exception(_should_retry),
             stop=stop_after_attempt(retries or self.cfg.http_retries),
             wait=wait_exponential_jitter(initial=2, max=30),
             reraise=True,
